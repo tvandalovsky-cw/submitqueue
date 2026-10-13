@@ -235,13 +235,68 @@ func unexportedFuncs(files []parsedFile) []funcSite {
 	return out
 }
 
+// deleteFuncDecl removes site's function and its doc comment, and any import
+// only the function used, which would otherwise fail the build on its own.
 func deleteFuncDecl(site funcSite) Patch {
 	startPos := site.decl.Pos()
 	if site.decl.Doc != nil {
 		startPos = site.decl.Doc.Pos()
 	}
 	start, end := wholeLines(site.pf.src, site.pf.offset(startPos), site.pf.offset(site.decl.End()))
-	return Patch{site.pf.path: splice(site.pf.src, []textEdit{{start: start, end: end}})}
+	edits := []textEdit{{start: start, end: end}}
+	edits = append(edits, orphanedImportEdits(site.pf, site.decl)...)
+	return Patch{site.pf.path: splice(site.pf.src, edits)}
+}
+
+// orphanedImportEdits removes the imports removed would leave unused. Only
+// imports removed itself refers to are candidates, so an import whose package
+// name differs from its path is never mistaken for unused.
+func orphanedImportEdits(pf parsedFile, removed ast.Node) []textEdit {
+	usedBy := func(n ast.Node, skip ast.Node) map[string]bool {
+		out := map[string]bool{}
+		ast.Inspect(n, func(x ast.Node) bool {
+			if x == skip {
+				return false
+			}
+			if sel, ok := x.(*ast.SelectorExpr); ok {
+				if id, ok := sel.X.(*ast.Ident); ok {
+					out[id.Name] = true
+				}
+			}
+			return true
+		})
+		return out
+	}
+	inRemoved := usedBy(removed, nil)
+	elsewhere := usedBy(pf.file, removed)
+	var edits []textEdit
+	for _, d := range pf.file.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.IMPORT {
+			continue
+		}
+		var orphaned []ast.Spec
+		for _, spec := range gd.Specs {
+			imp := spec.(*ast.ImportSpec)
+			name := importName(imp)
+			if name != "_" && name != "." && inRemoved[name] && !elsewhere[name] {
+				orphaned = append(orphaned, spec)
+			}
+		}
+		if len(orphaned) == 0 {
+			continue
+		}
+		if len(orphaned) == len(gd.Specs) {
+			start, end := wholeLines(pf.src, pf.offset(gd.Pos()), pf.offset(gd.End()))
+			edits = append(edits, textEdit{start: start, end: end})
+			continue
+		}
+		for _, spec := range orphaned {
+			start, end := wholeLines(pf.src, pf.offset(spec.Pos()), pf.offset(spec.End()))
+			edits = append(edits, textEdit{start: start, end: end})
+		}
+	}
+	return edits
 }
 
 func deleteCalledFunc(t Tree, dir string, r *rand.Rand) (Patch, bool) {
@@ -296,15 +351,8 @@ func addParam(t Tree, dir string, r *rand.Rand) (Patch, bool) {
 			continue
 		}
 		params := s.decl.Type.Params
-		text := p.name + " " + p.typ
-		if params.NumFields() > 0 {
-			text = ", " + text
-			if trailingComma(s.pf.src, s.pf.offset(params.Closing)) {
-				text = p.name + " " + p.typ + ","
-			}
-		}
-		at := s.pf.offset(params.Closing)
-		return Patch{s.pf.path: splice(s.pf.src, []textEdit{{start: at, end: at, text: text}})}, true
+		edit := appendToList(s.pf, params.Closing, params.NumFields() > 0, p.name+" "+p.typ)
+		return Patch{s.pf.path: splice(s.pf.src, []textEdit{edit})}, true
 	}
 	return nil, false
 }

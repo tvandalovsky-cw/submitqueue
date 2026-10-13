@@ -2,7 +2,7 @@
 
 How a model-backed base scorer (`jev`) sees enough of the code to tell a batch that will fail from one that will pass, without sending the whole repository on every call.
 
-**Status:** Tiers 1–3 are implemented: `submitqueue/extension/changediff` (git) returns each change's diff and, optionally, its touched files in full and references found in the tree; the `jev.diff` scorer option sends them (`files`, `references`). Tier 4 is proposed.
+**Status:** Tiers 1–3 are implemented: `submitqueue/extension/changediff` (git) returns each change's diff and, optionally, its touched files in full and references found in the tree; the `jev.diff` scorer option sends them (`files`, `references`). Tier 4 is prototyped as the `jev` scorer's `Ahead` option, graded offline by `tool/jevcorpus eval -ahead`, and is not wired into the orchestrator; see [Tier 4 prototype](#tier-4-prototype).
 
 See [outcome-scorer.md](outcome-scorer.md) for where a base price sits under the evidence layer, and [speculation.md](speculation.md) for how that price ranks speculation paths.
 
@@ -42,7 +42,7 @@ Every tier shares one per-batch byte budget, spent in tier order so the diff is 
 
 ## Placement
 
-Tiers 2 and 3 are further reads against the same local copy, so they belong beside the git differ — either a richer `changediff` git implementation or a separate context extension with the same input contract (`change.Change` in, per-URI content out). Tier 4 composes existing diffs and needs the batches ahead, which the scorer can resolve through `changeset.Resolver` from the path set it is already handed.
+Tiers 2 and 3 are further reads against the same local copy, so they belong beside the git differ — either a richer `changediff` git implementation or a separate context extension with the same input contract (`change.Change` in, per-URI content out). Tier 4 composes existing diffs and needs the batches ahead. A batch names its dependencies by ID only and `changeset.Resolver` needs the batch itself, so the scorer also needs a way to load a batch by ID — in the orchestrator, a read of the batch store supplied at wiring.
 
 ## Security
 
@@ -94,3 +94,12 @@ The same workload over four arms (no model, model without code, tier 1, tiers 1�
 - **The caller does not flip the signature break.** The model is handed the one untouched line still calling the old signature and still prices the change at 0.91. Providing the evidence is not sufficient; the fast model does not carry out the cross-reference. Candidate next steps are an explicit structural check that compares call arity against the new signature before asking, or a question that names the comparison (for example a second noul question per caller).
 - **The interaction failure is still priced low with its callee's definition in view**, so whatever the model keys on there, it is not the missing definition; tier 4 remains the only principled way to see it.
 - Queue cost follows: tiers 1–3 spent the fewest builds at budget 4 (22.0 against 22.5 for no model) and was fastest first-accept-to-last-land at both budgets, though at budget 2 tier 1 alone spent half a build fewer.
+
+## Tier 4 prototype
+
+The `jev` scorer's `Ahead` option takes a batch loader. When set, a batch's unfinished dependencies are loaded, their changes resolved and diffed, and sent as `changes_ahead` beside the batch's own changes, with a description saying they land first and are not part of the batch, and with a question that asks whether the batch passes on top of them. Changes ahead carry diffs only, under their own budget (`MaxAheadBytes`, 32KB by default), so they never displace the batch's own code; a dependency that has finished is skipped, and the cache key includes the dependency IDs. Without the option the request is unchanged.
+
+It is not wired into the orchestrator, for the reason above: with changes ahead the price is the batch's chance of passing *given* those batches land, and the generator would multiply it as if it were unconditional. `tool/jevcorpus eval -ahead` measures it offline instead, on the pair corpus of [synthetic-corpus.md](synthetic-corpus.md): each side of a pair is scored with the other queued ahead of it.
+
+On 12 pairs generated from this repository, against clean upstream code, scoring each side with the other ahead separated conflicting from compatible pairs at AUC 0.93–0.95 (24 scored sides), against 0.89 for both sides in one batch and chance for a size baseline. Signature and duplicate-definition conflicts were caught almost always; rename conflicts were missed about half the time, including a two-file rename against a one-line new caller. Scoring the change that alters an API with the new caller ahead was weaker than the reverse until the question named both directions, and individual borderline prices moved by up to 0.7 with that wording while unchanged requests repeated within 0.1 — the prompt matters more than run-to-run noise, and 12 pairs are too few to choose between wordings.
+

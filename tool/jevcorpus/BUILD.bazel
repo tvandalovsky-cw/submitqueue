@@ -3,10 +3,12 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "go_default_library",
     srcs = [
+        "behavior.go",
         "eval.go",
         "generate.go",
         "main.go",
         "manifest.go",
+        "pairs.go",
         "plan.go",
         "resolver.go",
     ],
@@ -42,9 +44,13 @@ go_binary(
 
 go_test(
     name = "go_default_test",
-    srcs = ["plan_test.go"],
+    srcs = [
+        "behavior_test.go",
+        "plan_test.go",
+    ],
     embed = [":go_default_library"],
     deps = [
+        "//submitqueue/entity:go_default_library",
         "//tool/jevcorpus/mutate:go_default_library",
         "@com_github_stretchr_testify//assert:go_default_library",
         "@com_github_stretchr_testify//require:go_default_library",

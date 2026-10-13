@@ -26,12 +26,21 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Tree is an immutable snapshot of Go source files keyed by slash-separated
 // path relative to the repository root.
 type Tree struct {
 	files map[string]string
+	// words counts identifier-shaped words across every file, built on first
+	// use. It is shared by copies of one Tree, which hold the same files.
+	words *wordIndex
+}
+
+type wordIndex struct {
+	once   sync.Once
+	counts map[string]int
 }
 
 // NewTree returns a Tree holding a copy of files.
@@ -40,7 +49,21 @@ func NewTree(files map[string]string) Tree {
 	for p, src := range files {
 		cp[p] = src
 	}
-	return Tree{files: cp}
+	return Tree{files: cp, words: &wordIndex{}}
+}
+
+// wordCount is how many times w appears as a whole identifier-shaped word in
+// the tree, comments and strings included.
+func (t Tree) wordCount(w string) int {
+	t.words.once.Do(func() {
+		t.words.counts = map[string]int{}
+		for _, src := range t.files {
+			for _, word := range identifierPattern.FindAllString(src, -1) {
+				t.words.counts[word]++
+			}
+		}
+	})
+	return t.words.counts[w]
 }
 
 // File returns the content at p.
@@ -87,7 +110,7 @@ func (t Tree) With(p Patch) Tree {
 	for k, v := range p {
 		cp[k] = v
 	}
-	return Tree{files: cp}
+	return Tree{files: cp, words: &wordIndex{}}
 }
 
 // Patch is a set of whole-file contents keyed by path. A path absent from the

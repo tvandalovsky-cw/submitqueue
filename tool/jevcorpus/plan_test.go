@@ -64,7 +64,10 @@ func validateTotal%[1]d%[2]d(n int) error {
 
 func unusedHelper%[1]d%[2]d(x int) int { return x + 1 }
 
-`, f, fn)
+// LegacyTotal%[3]d_%[1]d%[2]d is kept for callers outside this module.
+func LegacyTotal%[3]d_%[1]d%[2]d(x int) int { return x }
+
+`, f, fn, p)
 			}
 			path := fmt.Sprintf("%s/file%02d.go", dir, f)
 			files[path] = b.String()
@@ -203,7 +206,7 @@ func TestPlanEvalBatches(t *testing.T) {
 		{Branch: "b", Lands: false, Tier: TierXL, TargetTier: TierXL, Needle: ManifestNeedle{Mutator: "off-by-one", Position: NeedleLate, BeyondDiffBudget: true}},
 		{Branch: "c", Lands: true, Tier: TierM, TargetTier: TierM},
 	}
-	batches, rows := planEvalBatches(changes, evalFlags{batchSize: 3, batches: 2}, rand.New(rand.NewSource(1)))
+	batches, rows := planEvalBatches(changes, nil, evalFlags{batchSize: 3, batches: 2}, rand.New(rand.NewSource(1)))
 	require.Len(t, batches, 5)
 	require.Len(t, rows, 5)
 	assert.True(t, rows[0].Lands)
@@ -212,6 +215,95 @@ func TestPlanEvalBatches(t *testing.T) {
 	assert.Equal(t, []string{"1"}, batches[0].Contains)
 	assert.False(t, rows[3].Lands, "a batch holding a failing change fails")
 	assert.Len(t, batches[3].Contains, 3)
+}
+
+func TestPlanEvalBatchesWithPairs(t *testing.T) {
+	changes := []ManifestChange{
+		{Branch: "s1", Lands: true, Tier: TierS, TargetTier: TierS, Mutators: []string{"rename-func"}},
+		{Branch: "a", Lands: true, Tier: TierS, TargetTier: TierS, Pair: "p-0001"},
+		{Branch: "b", Lands: true, Tier: TierS, TargetTier: TierS, Pair: "p-0001"},
+		{Branch: "s2", Lands: false, Tier: TierS, TargetTier: TierS, Mutators: []string{"off-by-one"}},
+	}
+	pairs := []ManifestPair{{ID: "p-0001", Mutator: "rename-vs-new-caller", A: "a", B: "b", Lands: false}}
+
+	batches, rows := planEvalBatches(changes, pairs, evalFlags{batchSize: 2, batches: 5}, rand.New(rand.NewSource(1)))
+	require.Len(t, rows, 4+1+5)
+
+	assert.Equal(t, []string{"pair member alone"}, rows[1].Slices, "a pair side is graded alone, outside the single-change slices")
+	pair := rows[4]
+	assert.Equal(t, []string{"a", "b"}, pair.Branches)
+	assert.Equal(t, []string{"2", "3"}, batches[4].Contains)
+	assert.False(t, pair.Lands, "a pair is labeled by its verified outcome, not by its sides'")
+	assert.Equal(t, []string{"pairs", "pair family rename", "pair rename-vs-new-caller"}, pair.Slices)
+	for _, row := range rows[5:] {
+		assert.NotContains(t, row.Branches, "a", "sampled batches draw from single changes only")
+		assert.NotContains(t, row.Branches, "b")
+	}
+}
+
+func TestPlanEvalBatchesWithChangesAhead(t *testing.T) {
+	changes := []ManifestChange{
+		{Branch: "a", Lands: true, Pair: "p-0001"},
+		{Branch: "b", Lands: true, Pair: "p-0001"},
+	}
+	pairs := []ManifestPair{{ID: "p-0001", Mutator: "signature-vs-new-caller", A: "a", B: "b", Lands: false}}
+
+	batches, rows := planEvalBatches(changes, pairs, evalFlags{ahead: true}, rand.New(rand.NewSource(1)))
+	require.Len(t, rows, 2+1+2)
+	bWithA, aWithB := 3, 4
+	assert.Equal(t, []string{"b"}, rows[bWithA].Branches)
+	assert.Equal(t, []string{batches[0].ID}, batches[bWithA].Dependencies, "A's own batch is queued ahead")
+	assert.Equal(t, []string{"a"}, rows[aWithB].Branches)
+	assert.Equal(t, []string{batches[1].ID}, batches[aWithB].Dependencies)
+	for _, i := range []int{bWithA, aWithB} {
+		assert.False(t, rows[i].Lands, "a side on top of its conflicting partner fails")
+		assert.Contains(t, rows[i].Slices, "ahead family signature")
+	}
+	assert.Empty(t, batches[0].Dependencies, "a change scored alone has nothing ahead")
+}
+
+func TestPairFamilyJoinsTwins(t *testing.T) {
+	for _, intent := range []mutate.Intent{mutate.IntentSafe, mutate.IntentUnsafe} {
+		families := map[string]bool{}
+		for _, m := range mutate.PairsByIntent(intent) {
+			families[pairFamily(m.Name)] = true
+		}
+		assert.Len(t, families, len(mutate.PairsByIntent(intent)), "each %s pair mutator is its own family", intent)
+	}
+	for _, m := range mutate.PairsByIntent(mutate.IntentUnsafe) {
+		twin := false
+		for _, s := range mutate.PairsByIntent(mutate.IntentSafe) {
+			twin = twin || pairFamily(s.Name) == pairFamily(m.Name)
+		}
+		assert.True(t, twin, "%s has a compatible twin in its family", m.Name)
+	}
+}
+
+func TestPlanPairMutatorsCoversEveryFamily(t *testing.T) {
+	counts := map[string]int{}
+	unsafe := 0
+	for _, m := range planPairMutators(2*len(mutate.Pairs), 0.5, rand.New(rand.NewSource(1))) {
+		counts[m.Name]++
+		if m.Intent == mutate.IntentUnsafe {
+			unsafe++
+		}
+	}
+	assert.Equal(t, len(mutate.Pairs), unsafe)
+	for _, m := range mutate.Pairs {
+		assert.Equal(t, 2, counts[m.Name], m.Name)
+	}
+}
+
+func TestBuildPair(t *testing.T) {
+	tree, c := syntheticModule(6, 3)
+	for _, m := range mutate.Pairs {
+		t.Run(m.Name, func(t *testing.T) {
+			p, ok := buildPair(tree, c, m, rand.New(rand.NewSource(4)))
+			require.True(t, ok)
+			assert.NotEmpty(t, p.A)
+			assert.NotEmpty(t, p.B)
+		})
+	}
 }
 
 func mutatorNamed(t *testing.T, name string) mutate.Mutator {

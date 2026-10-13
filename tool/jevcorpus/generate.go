@@ -42,6 +42,11 @@ import (
 // package with existing vet findings would fail every safe change.
 const defaultVerify = "go build ./... && go test -count=1 $PKGS"
 
+// defaultCompileCheck builds the module and compiles the touched packages'
+// tests without running them: what a type-checker alone would catch, and the
+// baseline a model has to beat.
+const defaultCompileCheck = "go build ./... && go test -count=1 -run '^$' $PKGS"
+
 // triesPerSpec bounds how many changes are built and verified for one planned
 // slot before the slot is given up; most retries are intent mismatches.
 const triesPerSpec = 6
@@ -54,8 +59,9 @@ const queuedAtStepMs = 60_000
 
 type generateFlags struct {
 	repo, base, moduleDir, pkgs, out, sandbox, work, verify string
-	count                                                   int
-	unsafeRatio                                             float64
+	compileCheck                                            string
+	count, pairs, behaviorPairs                             int
+	unsafeRatio, unsafePairRatio                            float64
 	seed                                                    int64
 	keepMismatch                                            bool
 }
@@ -71,8 +77,12 @@ func runGenerate(args []string) error {
 	flags.StringVar(&f.sandbox, "sandbox", "", "bare sandbox repository to create; must not exist (required)")
 	flags.StringVar(&f.work, "work", "", "working clone to build in; defaults to a temporary directory")
 	flags.StringVar(&f.verify, "verify", defaultVerify, "shell command run at the module root; exit 0 means the change lands")
-	flags.IntVar(&f.count, "count", 40, "changes to generate")
-	flags.Float64Var(&f.unsafeRatio, "unsafe-ratio", 0.5, "share of changes designed to fail")
+	flags.IntVar(&f.count, "count", 40, "single changes to generate")
+	flags.Float64Var(&f.unsafeRatio, "unsafe-ratio", 0.5, "share of single changes designed to fail")
+	flags.IntVar(&f.pairs, "pairs", 0, "pairs of changes to generate, each side landing alone")
+	flags.Float64Var(&f.unsafePairRatio, "unsafe-pair-ratio", 0.5, "share of pairs designed to fail together")
+	flags.IntVar(&f.behaviorPairs, "behavior-pairs", 0, "pairs whose conflict is in behavior: a logic change against a new table test")
+	flags.StringVar(&f.compileCheck, "compile-check", defaultCompileCheck, "shell command run at the module root to decide whether a failing change still compiles")
 	flags.Int64Var(&f.seed, "seed", 1, "random seed; one seed and base always plan the same corpus")
 	flags.BoolVar(&f.keepMismatch, "keep-mismatch", false, "keep changes whose observed outcome contradicts their intent")
 	if err := flags.Parse(args); err != nil {
@@ -81,8 +91,11 @@ func runGenerate(args []string) error {
 	if f.repo == "" || f.out == "" || f.sandbox == "" {
 		return errors.New("-repo, -out, and -sandbox are required")
 	}
-	if f.count < 1 || f.unsafeRatio < 0 || f.unsafeRatio > 1 {
-		return errors.New("-count must be positive and -unsafe-ratio within [0, 1]")
+	if f.count < 0 || f.pairs < 0 || f.behaviorPairs < 0 || f.count+f.pairs+f.behaviorPairs == 0 {
+		return errors.New("-count, -pairs and -behavior-pairs must not be negative, and one must be positive")
+	}
+	if f.unsafeRatio < 0 || f.unsafeRatio > 1 || f.unsafePairRatio < 0 || f.unsafePairRatio > 1 {
+		return errors.New("-unsafe-ratio and -unsafe-pair-ratio must be within [0, 1]")
 	}
 	sandbox, err := filepath.Abs(f.sandbox)
 	if err != nil {
@@ -109,8 +122,10 @@ func generate(f generateFlags, sandbox string) error {
 		if _, err := git("", "clone", "--quiet", f.repo, work); err != nil {
 			return err
 		}
+	} else if _, err := git(work, "fetch", "--quiet", "origin"); err != nil {
+		return err
 	}
-	base, err := git(work, "rev-parse", f.base+"^{commit}")
+	base, err := resolveBase(work, f.base)
 	if err != nil {
 		return err
 	}
@@ -150,7 +165,7 @@ func generate(f generateFlags, sandbox string) error {
 				unbuildable++
 				continue
 			}
-			mc, title, err := commitChange(work, moduleRoot, base, branch, f.verify, tree, b, r)
+			mc, title, err := commitChange(work, moduleRoot, base, branch, f.verify, f.compileCheck, b, r)
 			if err != nil {
 				return fmt.Errorf("%s: %w", branch, err)
 			}
@@ -182,6 +197,95 @@ func generate(f generateFlags, sandbox string) error {
 				branch, s.intent, s.tier, triesPerSpec, unbuildable)
 		}
 	}
+
+	next := len(specs)
+	attempt := func(mc ManifestChange, title string, failsWith ...string) replay.Attempt {
+		next++
+		return replay.Attempt{
+			PR: next, Title: title, GroupSHA: mc.SHA, ParentSHA: base, Outcome: outcomeOf(mc.Lands),
+			DurationMs: mc.VerifyMs, QueuedAtMs: start + int64(next)*queuedAtStepMs,
+			ReplaySHA: mc.SHA, Branch: mc.Branch, FailsWith: failsWith,
+		}
+	}
+	recordPair := func(out pairOutcome) {
+		var failsWith []string
+		if !out.pair.Lands {
+			failsWith = []string{out.a.SHA}
+		}
+		manifest.Changes = append(manifest.Changes, out.a, out.b)
+		manifest.Pairs = append(manifest.Pairs, out.pair)
+		ds.Attempts = append(ds.Attempts, attempt(out.a, out.aTitle), attempt(out.b, out.bTitle, failsWith...))
+		logf("%s: %s together lands=%v compiles=%v noise=%d (%s + %s)",
+			out.pair.ID, out.pair.Mutator, out.pair.Lands, out.pair.CompilesTogether, out.pair.NoiseFiles, out.pair.A, out.pair.B)
+	}
+	pairNumber := 0
+	nextPair := func() (string, string, string) {
+		pairNumber++
+		return fmt.Sprintf("p-%04d", pairNumber), fmt.Sprintf("corpus/c-%04d", next+1), fmt.Sprintf("corpus/c-%04d", next+2)
+	}
+	for _, m := range planPairMutators(f.pairs, f.unsafePairRatio, r) {
+		id, branchA, branchB := nextPair()
+		var kept bool
+		for try := 0; try < triesPerSpec && !kept; try++ {
+			p, ok := buildPair(tree, cands, m, r)
+			if !ok {
+				break
+			}
+			p, noise := addPairNoise(tree, cands, p, r)
+			out, err := verifyPair(work, moduleRoot, base, f.verify, f.compileCheck, id, branchA, branchB, p, m.Name, m.Intent, noise, r)
+			if err != nil {
+				return fmt.Errorf("%s: %w", id, err)
+			}
+			if !out.accepted {
+				mismatches++
+				logf("%s: %s %s; retrying", id, m.Name, out.reason)
+				continue
+			}
+			kept = true
+			recordPair(out)
+		}
+		if !kept {
+			logf("%s: gave up on a %s pair; no candidate package has a site for it or every attempt contradicted it", id, m.Name)
+		}
+	}
+	for _, intent := range planIntents(f.behaviorPairs, f.unsafePairRatio, r) {
+		id, branchA, branchB := nextPair()
+		name := behaviorCompatible
+		if intent == mutate.IntentUnsafe {
+			name = behaviorConflict
+		}
+		var kept bool
+		for try := 0; try < triesPerSpec && !kept; try++ {
+			cand, ok, err := findBehaviorCandidate(work, moduleRoot, base, tree, cands, r)
+			if err != nil {
+				return fmt.Errorf("%s: %w", id, err)
+			}
+			if !ok {
+				continue
+			}
+			b, ok := behaviorTestPatch(tree, cand, chooseBehaviorCases(cand, intent == mutate.IntentUnsafe, r))
+			if !ok {
+				continue
+			}
+			p, noise := addPairNoise(tree, cands, mutate.Pair{A: cand.mutant.Patch, B: b}, r)
+			out, err := verifyPair(work, moduleRoot, base, f.verify, f.compileCheck, id, branchA, branchB, p, name, intent, noise, r)
+			if err != nil {
+				return fmt.Errorf("%s: %w", id, err)
+			}
+			if !out.accepted {
+				mismatches++
+				logf("%s: %s on %s.%s %s; retrying", id, name, cand.target.Package, cand.target.Func, out.reason)
+				continue
+			}
+			kept = true
+			out.pair.Function = cand.target.Package + "." + cand.target.Func
+			out.pair.BehaviorMutator = cand.mutant.Mutator
+			recordPair(out)
+		}
+		if !kept {
+			logf("%s: gave up on a %s pair", id, name)
+		}
+	}
 	if len(ds.Attempts) == 0 {
 		return errors.New("no change was kept")
 	}
@@ -195,51 +299,88 @@ func generate(f generateFlags, sandbox string) error {
 	if err := writeJSON(manifestPathFor(f.out), manifest); err != nil {
 		return err
 	}
-	logf("kept %d of %d planned changes; %d built changes contradicted their intent", len(ds.Attempts), len(specs), mismatches)
+	logf("kept %d of %d planned single changes and %d of %d planned pairs; %d built changes or pairs contradicted their intent",
+		len(manifest.Changes)-2*len(manifest.Pairs), len(specs), len(manifest.Pairs), f.pairs+f.behaviorPairs, mismatches)
 	printGrid(manifest)
 	return nil
 }
 
 // commitChange writes b onto a clean base, verifies it, and commits it to
 // branch whatever the outcome; the caller decides whether to keep it.
-func commitChange(work, moduleRoot, base, branch, verify string, tree mutate.Tree, b built, r *rand.Rand) (ManifestChange, string, error) {
-	if err := resetWorkTree(work, base); err != nil {
-		return ManifestChange{}, "", err
-	}
-	for p, src := range b.patch {
-		full := filepath.Join(work, filepath.FromSlash(p))
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return ManifestChange{}, "", err
-		}
-		if err := os.WriteFile(full, []byte(src), 0o644); err != nil {
-			return ManifestChange{}, "", err
-		}
-	}
-	if _, err := git(work, "add", "-A"); err != nil {
+func commitChange(work, moduleRoot, base, branch, verify, compileCheck string, b built, r *rand.Rand) (ManifestChange, string, error) {
+	if err := stagePatch(work, base, b.patch); err != nil {
 		return ManifestChange{}, "", err
 	}
 	mc := ManifestChange{Branch: branch, Mutators: b.mutators}
 	if err := measureStaged(work, &mc, b.needle); err != nil {
 		return ManifestChange{}, "", err
 	}
+	v, err := runVerify(work, moduleRoot, verify, b.patch)
+	if err != nil {
+		return ManifestChange{}, "", err
+	}
+	mc.Lands, mc.VerifyMs, mc.VerifyTail = v.lands, v.ms, v.tail
+	mc.Compiles = v.lands
+	if !v.lands {
+		c, err := runVerify(work, moduleRoot, compileCheck, b.patch)
+		if err != nil {
+			return ManifestChange{}, "", err
+		}
+		mc.Compiles = c.lands
+	}
+	title := commitSubject(b.patch, r)
+	if mc.SHA, err = commitStaged(work, branch, title, r); err != nil {
+		return ManifestChange{}, "", err
+	}
+	return mc, title, nil
+}
 
-	pkgs := touchedPackages(work, moduleRoot, b.patch)
+// stagePatch resets the work tree to base and stages p on it.
+func stagePatch(work, base string, p mutate.Patch) error {
+	if err := resetWorkTree(work, base); err != nil {
+		return err
+	}
+	for file, src := range p {
+		full := filepath.Join(work, filepath.FromSlash(file))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(full, []byte(src), 0o644); err != nil {
+			return err
+		}
+	}
+	_, err := git(work, "add", "-A")
+	return err
+}
+
+type verifyResult struct {
+	lands bool
+	ms    int64
+	tail  string
+}
+
+// runVerify runs the verify command over the staged tree, with the packages p
+// touches in $PKGS. A non-zero exit is a result; failing to run is an error.
+func runVerify(work, moduleRoot, verify string, p mutate.Patch) (verifyResult, error) {
 	began := time.Now()
 	cmd := exec.Command("sh", "-c", verify)
 	cmd.Dir = moduleRoot
-	cmd.Env = append(os.Environ(), "PKGS="+strings.Join(pkgs, " "))
-	out, verr := cmd.CombinedOutput()
-	mc.VerifyMs = time.Since(began).Milliseconds()
-	mc.Lands = verr == nil
-	if !mc.Lands {
+	cmd.Env = append(os.Environ(), "PKGS="+strings.Join(touchedPackages(work, moduleRoot, p), " "))
+	out, err := cmd.CombinedOutput()
+	v := verifyResult{lands: err == nil, ms: time.Since(began).Milliseconds()}
+	if err != nil {
 		var exitErr *exec.ExitError
-		if !errors.As(verr, &exitErr) {
-			return ManifestChange{}, "", fmt.Errorf("run verify: %w", verr)
+		if !errors.As(err, &exitErr) {
+			return verifyResult{}, fmt.Errorf("run verify: %w", err)
 		}
-		mc.VerifyTail = tailLines(string(out), verifyTailLines)
+		v.tail = tailLines(string(out), verifyTailLines)
 	}
+	return v, nil
+}
 
-	title := commitSubject(b.patch, r)
+// commitStaged commits the staged tree under a neutral subject and a pooled
+// author, and points branch at it.
+func commitStaged(work, branch, title string, r *rand.Rand) (string, error) {
 	who := authors[r.Intn(len(authors))]
 	commit := exec.Command("git", "-c", "commit.gpgsign=false", "commit", "--quiet", "--no-verify", "-m", title)
 	commit.Dir = work
@@ -247,17 +388,16 @@ func commitChange(work, moduleRoot, base, branch, verify string, tree mutate.Tre
 		"GIT_AUTHOR_NAME="+who.name, "GIT_AUTHOR_EMAIL="+who.email,
 		"GIT_COMMITTER_NAME=jevcorpus", "GIT_COMMITTER_EMAIL=jevcorpus@submitqueue.invalid")
 	if _, err := run(commit); err != nil {
-		return ManifestChange{}, "", err
+		return "", err
 	}
 	sha, err := git(work, "rev-parse", "HEAD")
 	if err != nil {
-		return ManifestChange{}, "", err
+		return "", err
 	}
-	mc.SHA = sha
 	if _, err := git(work, "branch", "--force", branch, sha); err != nil {
-		return ManifestChange{}, "", err
+		return "", err
 	}
-	return mc, title, nil
+	return sha, nil
 }
 
 // measureStaged records the staged change's size and where its needle sits
@@ -310,6 +450,23 @@ func touchedPackages(work, moduleRoot string, p mutate.Patch) []string {
 		}
 	}
 	return out
+}
+
+// resolveBase resolves -base against the seed repository's refs rather than
+// the work clone's own: a reused clone's HEAD and branches point at commits
+// an earlier run made, which would silently become the next corpus's base. A
+// commit SHA or tag resolves as itself.
+func resolveBase(work, base string) (string, error) {
+	candidates := []string{"refs/remotes/origin/" + base, base}
+	if base == "HEAD" {
+		candidates = []string{"refs/remotes/origin/HEAD"}
+	}
+	for _, ref := range candidates {
+		if sha, err := git(work, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil {
+			return sha, nil
+		}
+	}
+	return "", fmt.Errorf("-base %q is not a branch, tag, or commit of the seed repository", base)
 }
 
 func resetWorkTree(work, base string) error {
@@ -434,6 +591,9 @@ func printGrid(m Manifest) {
 		grid[t] = &cell{}
 	}
 	for _, c := range m.Changes {
+		if c.Pair != "" {
+			continue
+		}
 		if c.Lands {
 			grid[c.Tier].lands++
 		} else {
@@ -443,6 +603,17 @@ func printGrid(m Manifest) {
 	fmt.Println("tier  lands  fails")
 	for _, t := range tiers {
 		fmt.Printf("%-4s  %5d  %5d\n", t, grid[t].lands, grid[t].fails)
+	}
+	if len(m.Pairs) > 0 {
+		together := cell{}
+		for _, p := range m.Pairs {
+			if p.Lands {
+				together.lands++
+			} else {
+				together.fails++
+			}
+		}
+		fmt.Printf("pairs %5d  %5d  (outcome together; every side lands alone)\n", together.lands, together.fails)
 	}
 }
 

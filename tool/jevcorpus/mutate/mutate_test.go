@@ -15,6 +15,7 @@
 package mutate
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -98,8 +99,27 @@ func typeCheck(t Tree, dir string) error {
 		}
 		files = append(files, f)
 	}
-	_, err := (&types.Config{}).Check(dir, fset, files, nil)
+	_, err := (&types.Config{Importer: fakeImporter{}}).Check(dir, fset, files, nil)
 	return err
+}
+
+// fakeImporter serves a minimal context package — the one import a mutation
+// adds — so type-checking needs no toolchain export data.
+type fakeImporter struct{}
+
+func (fakeImporter) Import(path string) (*types.Package, error) {
+	if path != "context" {
+		return nil, fmt.Errorf("fixture imports only context, not %q", path)
+	}
+	pkg := types.NewPackage("context", "context")
+	ctx := types.NewNamed(types.NewTypeName(token.NoPos, pkg, "Context", nil), types.NewInterfaceType(nil, nil).Complete(), nil)
+	pkg.Scope().Insert(ctx.Obj())
+	for _, name := range []string{"TODO", "Background"} {
+		sig := types.NewSignatureType(nil, nil, nil, nil, types.NewTuple(types.NewVar(token.NoPos, pkg, "", ctx)), false)
+		pkg.Scope().Insert(types.NewFunc(token.NoPos, pkg, name, sig))
+	}
+	pkg.MarkComplete()
+	return pkg, nil
 }
 
 func TestFixtureTypeChecks(t *testing.T) {
@@ -207,6 +227,27 @@ func TestAddParamHandlesTrailingComma(t *testing.T) {
 	assert.Error(t, typeCheck(tree.With(patch), "pkg"))
 	_, parses := gofmt(patch["pkg/a.go"])
 	assert.True(t, parses)
+}
+
+func TestDeleteFuncDropsImportsOnlyItUsed(t *testing.T) {
+	src := "package sample\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\n" +
+		"func shout(s string) string { return strings.ToUpper(fmt.Sprint(s)) }\n\n" +
+		"func Label(s string) string { return fmt.Sprintf(\"[%s]\", s) }\n"
+	tree := NewTree(map[string]string{"pkg/a.go": src})
+	patch, ok := DeleteDeadFunc.Apply(tree, "pkg", rand.New(rand.NewSource(1)))
+	require.True(t, ok)
+	got := patch["pkg/a.go"]
+	assert.NotContains(t, got, "shout")
+	assert.NotContains(t, got, `"strings"`, "an import only the deleted function used is removed")
+	assert.Contains(t, got, `"fmt"`, "an import still used elsewhere stays")
+}
+
+func TestDeleteFuncDropsAWholeImportDecl(t *testing.T) {
+	src := "package sample\n\nimport \"strings\"\n\nfunc shout(s string) string { return strings.ToUpper(s) }\n\n// V is a value.\nvar V = 1\n"
+	tree := NewTree(map[string]string{"pkg/a.go": src})
+	patch, ok := DeleteDeadFunc.Apply(tree, "pkg", rand.New(rand.NewSource(1)))
+	require.True(t, ok)
+	assert.NotContains(t, patch["pkg/a.go"], "import")
 }
 
 func TestByIntent(t *testing.T) {

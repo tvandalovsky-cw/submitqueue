@@ -53,6 +53,23 @@ const (
 	DefaultMaxContextBytes = 64 << 10
 )
 
+// DefaultMaxAheadBytes caps the diff text of the changes ahead sent per batch.
+// It is a budget of its own, so context from the queue never displaces the
+// batch's own code.
+const DefaultMaxAheadBytes = 32 << 10
+
+// landsOnTopQuestion replaces landsQuestion when the state carries changes
+// ahead. It asks about the batch alone, built on top of them: a change ahead
+// that fails by itself is not this batch's failure.
+var landsOnTopQuestion = systemOneQuestion{
+	Type:         questionTypeNoul,
+	Instructions: "Will this batch of code changes pass its CI build and merge cleanly when it is built on top of changes_ahead? Those changes are queued in front of this batch and land first; they are not part of it. Judge whether the two still build and pass together, in either direction: whether this batch relies on code that changes_ahead renames, removes, redefines or changes the signature of, and whether changes_ahead relies on code that this batch does, or both define the same name. A change may also include modified_files_after_change, the full text of files it modifies, and repository_context, unmodified code elsewhere in the repository that relates to the change.",
+	Criteria: map[string]string{
+		"true":  "The batch builds and its tests pass on top of changes_ahead, and it merges without conflict.",
+		"false": "With changes_ahead in place, the batch fails to build, breaks tests, or cannot be merged.",
+	},
+}
+
 var landsQuestion = systemOneQuestion{
 	Type:         questionTypeNoul,
 	Instructions: "Will this batch of code changes pass its CI build and merge cleanly into the target branch? Judge the code in each change's diff. A change may also include modified_files_after_change, the full text of files it modifies, and repository_context, unmodified code elsewhere in the repository that relates to the change.",
@@ -84,6 +101,13 @@ type Params struct {
 	// MaxDiffBytes and MaxContextBytes cap the code sent per batch. Zero means
 	// DefaultMaxDiffBytes and DefaultMaxContextBytes.
 	MaxDiffBytes, MaxContextBytes int
+	// Ahead loads the batches a batch depends on, whose changes are then sent
+	// as changes_ahead: queued in front and landing first. Nil sends none, and
+	// the request is exactly what it is without the option.
+	Ahead BatchLoader
+	// MaxAheadBytes caps the diff text of changes ahead per batch. Zero means
+	// DefaultMaxAheadBytes.
+	MaxAheadBytes int
 	// Cache is shared across scorers built from one configuration. Nil disables
 	// caching.
 	Cache *Cache
@@ -94,6 +118,12 @@ type Params struct {
 	Logger *zap.SugaredLogger
 	// MetricsScope receives score latency and cache/fallback counters.
 	MetricsScope tally.Scope
+}
+
+// BatchLoader reads a batch by ID. A batch names its dependencies by ID only,
+// and resolving their changes needs the batch itself.
+type BatchLoader interface {
+	Batch(ctx context.Context, queue, id string) (entity.Batch, error)
 }
 
 type jevScorer struct {
@@ -119,6 +149,9 @@ func New(p Params) scorer.Scorer {
 	if p.MaxContextBytes <= 0 {
 		p.MaxContextBytes = DefaultMaxContextBytes
 	}
+	if p.MaxAheadBytes <= 0 {
+		p.MaxAheadBytes = DefaultMaxAheadBytes
+	}
 	return &jevScorer{p: p}
 }
 
@@ -127,6 +160,13 @@ func (s *jevScorer) Score(ctx context.Context, batch entity.Batch, paths entity.
 	defer func() { op.Complete(retErr) }()
 
 	key := batch.Queue + "/" + batch.ID
+	if s.p.Ahead != nil {
+		// A batch's dependencies can shrink as the batches ahead finish, and
+		// with them the price; the key carries them so a stale price is a miss.
+		deps := append([]string(nil), batch.Dependencies...)
+		sort.Strings(deps)
+		key += "?ahead=" + strings.Join(deps, ",")
+	}
 	if s.p.Cache != nil {
 		if price, ok := s.p.Cache.get(key); ok {
 			metrics.NamedCounter(s.p.MetricsScope, "score", "cache_hit", 1)
@@ -169,7 +209,17 @@ func (s *jevScorer) askModel(ctx context.Context, batch entity.Batch) (float64, 
 		ctx, cancel = context.WithTimeout(ctx, s.p.Timeout)
 		defer cancel()
 	}
-	price, model, err := askNoul(ctx, s.p.HTTPClient, s.p.Path, s.p.Model, questionName, landsQuestion, batchState(changes, content, s.p.MaxDiffBytes, s.p.MaxContextBytes))
+	state := batchState(changes, content, s.p.MaxDiffBytes, s.p.MaxContextBytes)
+	question := landsQuestion
+	ahead, err := s.changesAhead(ctx, batch)
+	if err != nil {
+		return 0, err
+	}
+	if ahead != nil {
+		state.ChangesAhead = ahead
+		question = landsOnTopQuestion
+	}
+	price, model, err := askNoul(ctx, s.p.HTTPClient, s.p.Path, s.p.Model, questionName, question, state)
 	if err != nil {
 		return 0, err
 	}
@@ -198,6 +248,48 @@ func (s *jevScorer) contentForBatch(ctx context.Context, batch entity.Batch) (ma
 		}
 	}
 	return content, nil
+}
+
+// changesAhead describes the changes of batch's unfinished dependencies, or
+// nil when there are none or no Ahead loader. A dependency that has finished is
+// skipped: one that landed is already in the target, and one that failed or
+// was cancelled never will be. Only diffs are sent for them, never full files
+// or references, and a diff that cannot be read is a failure as for the
+// batch's own.
+func (s *jevScorer) changesAhead(ctx context.Context, batch entity.Batch) (*changesAheadState, error) {
+	if s.p.Ahead == nil || len(batch.Dependencies) == 0 {
+		return nil, nil
+	}
+	deps := append([]string(nil), batch.Dependencies...)
+	sort.Strings(deps)
+	var all entity.BatchChanges
+	content := map[string]entity.ChangeDiff{}
+	for _, id := range deps {
+		dep, err := s.p.Ahead.Batch(ctx, batch.Queue, id)
+		if err != nil {
+			return nil, fmt.Errorf("load batch %s ahead of %s: %w", id, batch.ID, err)
+		}
+		if dep.State.IsTerminal() {
+			continue
+		}
+		changes, err := s.p.Resolver.DetailedForBatch(ctx, dep)
+		if err != nil {
+			return nil, fmt.Errorf("resolve changes for batch %s ahead of %s: %w", id, batch.ID, err)
+		}
+		all.Changes = append(all.Changes, changes.Changes...)
+		code, err := s.contentForBatch(ctx, dep)
+		if err != nil {
+			return nil, err
+		}
+		for uri, d := range code {
+			content[uri] = entity.ChangeDiff{URI: uri, Patch: d.Patch}
+		}
+	}
+	if len(all.Changes) == 0 {
+		return nil, nil
+	}
+	doc := batchState(all, content, s.p.MaxAheadBytes, 0)
+	return &changesAheadState{Description: changesAheadDescription, Changes: doc.Changes}, nil
 }
 
 // The types below are the JSON the model reads. Field names are chosen to be
@@ -261,6 +353,15 @@ type codeLineState struct {
 // otherwise read as missing data rather than as a deletion.
 const removedDeclaration = "(removed by this change)"
 
+// changesAheadDescription labels the changes ahead for the model, which
+// otherwise could read them as part of the batch it is judging.
+const changesAheadDescription = "Changes queued ahead of this batch. They land first and this batch is built on top of them; they are not part of this batch."
+
+type changesAheadState struct {
+	Description string        `json:"description"`
+	Changes     []changeState `json:"changes"`
+}
+
 type batchStateDoc struct {
 	Queue             string        `json:"queue"`
 	ChangeCount       int           `json:"change_count"`
@@ -268,6 +369,9 @@ type batchStateDoc struct {
 	TotalLinesChanged int           `json:"total_lines_changed"`
 	FilesTruncated    bool          `json:"files_truncated,omitempty"`
 	Changes           []changeState `json:"changes"`
+	// ChangesAhead is absent without an Ahead loader or unfinished
+	// dependencies.
+	ChangesAhead *changesAheadState `json:"changes_ahead,omitempty"`
 }
 
 // batchState describes a batch to the model. Changes are sorted by URI so the

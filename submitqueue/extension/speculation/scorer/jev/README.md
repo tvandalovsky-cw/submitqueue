@@ -8,6 +8,8 @@ Each score is one `POST` of a System One body to the configured path — LiteLLM
 
 With `jev.diff.files` and `jev.diff.references`, each change also carries `file_contents` (touched files in full) and `references` (`caller` and `definition` lines from elsewhere in the tree), from a separate 64KB budget spent only after every diff.
 
+With an `Ahead` batch loader, the batch's unfinished dependencies are also loaded and their diffs sent as `changes_ahead`, under their own 32KB budget, and the question asks whether the batch passes on top of them. The price is then conditional on those batches landing, which the speculation generator does not yet model, so the option is for offline evaluation only and has no `profiles.yaml` field; see [code-aware-scoring.md](../../../../../doc/rfc/submitqueue/code-aware-scoring.md#tier-4-prototype).
+
 Sending diffs sends the code to the proxy and its model provider. It is opt-in for that reason.
 
 The answer's `noul` is the price. A refusal, a missing answer, a value outside `[0, 1]`, a non-2xx status or a transport error is a failure.

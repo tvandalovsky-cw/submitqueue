@@ -38,8 +38,43 @@ type Manifest struct {
 	Seed int64 `json:"seed"`
 	// Verify is the shell command whose exit status is the label.
 	Verify string `json:"verify"`
-	// Changes are in dataset order.
+	// Changes are in dataset order, pair members included.
 	Changes []ManifestChange `json:"changes"`
+	// Pairs are the changes generated two at a time.
+	Pairs []ManifestPair `json:"pairs,omitempty"`
+}
+
+// ManifestPair is two changes made against the same base, each verified to
+// land alone, and verified again together.
+type ManifestPair struct {
+	// ID names the pair within the corpus.
+	ID string `json:"id"`
+	// Mutator is the pair mutator that made it.
+	Mutator string `json:"mutator"`
+	// Intent is what landing both was designed to do.
+	Intent mutate.Intent `json:"intent"`
+	// A and B are the two sides' branches.
+	A string `json:"a"`
+	B string `json:"b"`
+	// ASHA and BSHA are the two sides' commits.
+	ASHA string `json:"a_sha"`
+	BSHA string `json:"b_sha"`
+	// Lands is the observed label for both together.
+	Lands bool `json:"lands"`
+	// CompilesTogether is whether both together pass the compile check: true
+	// when they land, and for a conflict that only shows when tests run.
+	CompilesTogether bool `json:"compiles_together"`
+	// NoiseFiles is how many unrelated files the two sides also edit.
+	NoiseFiles int `json:"noise_files,omitempty"`
+	// Function is the package-qualified function a behavior pair's sides
+	// change and test; empty for other pairs.
+	Function string `json:"function,omitempty"`
+	// BehaviorMutator is the edit a behavior pair's A makes to Function.
+	BehaviorMutator string `json:"behavior_mutator,omitempty"`
+	// VerifyMs is how long verifying both together took, in milliseconds.
+	VerifyMs int64 `json:"verify_ms"`
+	// VerifyTail is the end of that run's output when it failed.
+	VerifyTail string `json:"verify_tail,omitempty"`
 }
 
 // ManifestChange is one generated change.
@@ -52,6 +87,8 @@ type ManifestChange struct {
 	Intent mutate.Intent `json:"intent"`
 	// Lands is the observed label: Verify passed.
 	Lands bool `json:"lands"`
+	// Compiles is whether the change passes the compile check alone.
+	Compiles bool `json:"compiles"`
 	// TargetTier is the size the planner aimed for.
 	TargetTier Tier `json:"target_tier"`
 	// Tier is the size measured from git's diff.
@@ -70,6 +107,9 @@ type ManifestChange struct {
 	VerifyMs int64 `json:"verify_ms"`
 	// VerifyTail is the end of Verify's output when it failed.
 	VerifyTail string `json:"verify_tail,omitempty"`
+	// Pair is the ID of the pair this change is a side of; empty for a single
+	// change.
+	Pair string `json:"pair,omitempty"`
 }
 
 // ManifestNeedle locates the unsafe edit in a large change.
@@ -91,6 +131,9 @@ type ManifestNeedle struct {
 // Category names the kind of change for slicing results: the mutator of a
 // single-edit change, or "sweep" with its needle for a large one.
 func (c ManifestChange) Category() string {
+	if c.Pair != "" {
+		return "pair member"
+	}
 	if c.Needle.Mutator != "" {
 		return "sweep+" + c.Needle.Mutator
 	}

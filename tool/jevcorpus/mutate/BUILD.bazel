@@ -4,6 +4,8 @@ go_library(
     name = "go_default_library",
     srcs = [
         "mutator.go",
+        "pair.go",
+        "realistic.go",
         "safe.go",
         "source.go",
         "tree.go",
@@ -15,7 +17,11 @@ go_library(
 
 go_test(
     name = "go_default_test",
-    srcs = ["mutate_test.go"],
+    srcs = [
+        "mutate_test.go",
+        "pair_test.go",
+        "realistic_test.go",
+    ],
     embed = [":go_default_library"],
     deps = [
         "@com_github_stretchr_testify//assert:go_default_library",

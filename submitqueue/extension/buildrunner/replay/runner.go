@@ -51,8 +51,9 @@ type runner struct {
 
 // New returns a replay build runner. A build fails if any change in its base
 // or head is recorded as failing — a build containing a broken change is
-// broken whatever it was meant to test — and takes the longest recorded
-// duration among them. Changes with no record pass instantly.
+// broken whatever it was meant to test — or if two of them are recorded as
+// failing together, and takes the longest recorded duration among them.
+// Changes with no record pass instantly.
 func New(p Params) buildrunner.BuildRunner {
 	if p.TimeScale < 1 {
 		p.TimeScale = 1
@@ -65,7 +66,7 @@ func New(p Params) buildrunner.BuildRunner {
 
 func (r *runner) Trigger(ctx context.Context, base []entity.Batch, head entity.Batch, _ entity.BuildMetadata) (entity.BuildID, error) {
 	batches := append(append([]entity.Batch{}, base...), head)
-	fails := false
+	var found []Attempt
 	var longest int64
 	for _, b := range batches {
 		changes, err := r.p.Resolver.ChangesForBatch(ctx, b)
@@ -73,12 +74,12 @@ func (r *runner) Trigger(ctx context.Context, base []entity.Batch, head entity.B
 			return entity.BuildID{}, fmt.Errorf("replay: resolve batch %s: %w", b.ID, err)
 		}
 		for _, a := range r.recorded(changes) {
-			fails = fails || a.Outcome == OutcomeFail
+			found = append(found, a)
 			longest = max(longest, a.DurationMs)
 		}
 	}
 	outcome := OutcomePass
-	if fails {
+	if anyFails(found) {
 		outcome = OutcomeFail
 	}
 	due := r.p.Now().UnixMilli() + int64(float64(longest)/r.p.TimeScale)

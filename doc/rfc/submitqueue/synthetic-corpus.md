@@ -2,7 +2,7 @@
 
 Grading outcome scorers on generated Go changes whose outcome is caused by their code and confirmed by building and testing them, as a counterpart to the noisy labels of replayed history.
 
-**Status:** Phase 1 is implemented as `tool/jevcorpus`: ten mutators, size-tiered sweeps with planted needles, build-verified labels, a replay-format dataset and sandbox, and offline grading of `jev` against a size baseline. Interaction pairs (phase 2) and queue runs at scale (phase 3) are proposed.
+**Status:** Phases 1 and 2 are implemented as `tool/jevcorpus`: ten single-change mutators, size-tiered sweeps with planted needles, eight pair mutators, build-verified labels, a replay-format dataset and sandbox whose runner understands pairs, and offline grading of `jev` against a size baseline. Queue runs at scale (phase 3) are proposed.
 
 See [replay-benchmark.md](replay-benchmark.md) for the real-history benchmark this complements and [code-aware-scoring.md](code-aware-scoring.md) for what the `jev` scorer sends.
 
@@ -47,11 +47,28 @@ Slices holding one outcome, such as a single unsafe mutator, have no AUC; their 
 ## Phases
 
 1. **Single changes** (implemented): mutators, tiers, needles, verified labels, offline grading.
-2. **Interaction pairs** (proposed): two changes that each pass alone and fail together — a rename against a new caller of the old name, two changes adding the same symbol — which is what batch scoring exists to catch. The replay runner fails a build only when a member is recorded as failing, so pairs need either a dataset record of which combinations fail, verified at generation time, or a build runner that builds the merged tree.
+2. **Interaction pairs** (implemented): see below.
 3. **Queue runs** (proposed): the corpus through the git compose overlay with the replay runner, for time to land and wasted builds, compared with replay results on the same seed.
+
+## Interaction pairs
+
+A pair is two changes made against the same base that touch disjoint files, so their textual merge is always clean. Each side is verified to land alone, and the two are verified together. This is the commonest code failure found in real merge-queue history: one change alters an API and updates every use it can see, while another, written against the old API, adds a use it cannot — cilium#45579 and pulumi#24570 and #24588 are examples.
+
+Five structural pair mutators conflict, each written to read as routine work: threading a `context.Context` through a function and every call — callers pass their own context or `context.TODO()` — against a new caller with the old arguments; a rename against a new use of the old name; deleting an unexported function nothing references against its first new caller; retiring an exported function nothing in the repository mentions against its first new caller; and two changes adding the same helper. A new caller is an exported function, so it reads as new API rather than dead code. Each has a compatible twin of the same shape — the same A against a B that touches a different function, or a different helper — so that the shape of a pair cannot predict its outcome; a family's AUC asks whether a scorer tells the twins apart. The planner cycles through the mutators so every family is represented however rare its sites. The unexported delete family finds no site in a lint-clean seed and is kept for seeds that have dead code.
+
+Structural conflicts are compile errors, which a type-checker finds for nothing. Behavior pairs conflict where no compiler looks. A changes one comparison in a function whose parameters and results are basic values, in a way the package's existing tests do not notice; B adds a table-driven test of that function. The function is probed first — called on a few dozen literal inputs, twice each to drop anything nondeterministic, at the base and under each candidate change — and B's expected values are the base's outputs. A conflicting B includes an input A's change affects; its twin tests the same function on inputs A's change leaves alone, so telling them apart means reasoning about what the function returns.
+
+Each side of a pair, half the time, also carries unrelated mechanical edits in up to three other files, as real changes carry more than the line that matters.
+
+Both sides are committed as ordinary numbered branches with neutral subjects. The dataset records the conflict as `fails_with` on the second side, which the replay runner and the oracle read: a build holding both fails, and a build holding either alone passes. The manifest records each pair's mutator, intent, combined verification, noise, and whether the two together still compile — every change and pair is also run through a compile check, which builds the module and compiles the touched packages' tests without running them. `eval -scorers compile` prices from that record: the type-checker baseline a model has to beat, perfect on structural conflicts and blind to behavior ones.
+
+Grading puts both sides in one batch, labeled with the combined outcome, and grades each side alone separately. Comparing the two separates a scorer that sees the interaction from one that reacts to a side that merely looks risky. With `-ahead`, each side is also scored with the other queued ahead of it, which is the framing a live queue would supply. A batch holds one request in the orchestrator today, so a scorer is never shown both sides of a pair in a live queue; the pair slice measures what it could do with that context, which is what request grouping or context from the batches ahead would supply.
 
 ## Known limits
 
 - Verification runs the touched packages' tests, not their dependents', so a change that breaks only a downstream package's tests is labeled as landing. A broader verify command trades generation time for that.
 - Mutations are syntactic. They do not produce semantic conflicts across packages, concurrency bugs, or performance regressions, and a model could in principle learn their shapes; holding out a seed or a mutator from any tuning guards against that.
+- The `delete` pair family needs an unexported function nothing references, which a lint-clean seed does not have; on this repository it produces no pairs. Deleting an exported function with no in-repository caller would be the realistic form.
+- A threaded context is passed along but not yet used inside the function, as in a first plumbing change; a repository that lints for unused parameters would flag it.
+- Behavior conflicts are limited to functions of basic values and to one flipped or relaxed comparison; behavior behind interfaces, I/O or shared state is not probed.
 - Sweeps are mechanical, which real large changes rarely are. They test whether a scorer can find one consequential line in a large diff, not whether it understands a large redesign.

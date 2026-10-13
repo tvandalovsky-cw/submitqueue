@@ -34,6 +34,9 @@ const (
 	passSHA    = "1111111111111111111111111111111111111111"
 	failSHA    = "2222222222222222222222222222222222222222"
 	unknownSHA = "3333333333333333333333333333333333333333"
+	// pairASHA and pairBSHA each pass alone and fail together.
+	pairASHA = "4444444444444444444444444444444444444444"
+	pairBSHA = "5555555555555555555555555555555555555555"
 )
 
 func uriFor(sha string) string {
@@ -45,6 +48,8 @@ func testIndex() Index {
 		{PR: 1, ReplaySHA: passSHA, Outcome: OutcomePass, DurationMs: 60_000},
 		{PR: 2, ReplaySHA: failSHA, Outcome: OutcomeFail, DurationMs: 120_000},
 		{PR: 3, Outcome: OutcomePass, Skipped: "conflict"},
+		{PR: 4, ReplaySHA: pairASHA, Outcome: OutcomePass, DurationMs: 30_000},
+		{PR: 5, ReplaySHA: pairBSHA, Outcome: OutcomePass, DurationMs: 30_000, FailsWith: []string{pairASHA}},
 	}})
 }
 
@@ -68,6 +73,10 @@ func TestRunner(t *testing.T) {
 		// dependency in, and so fails whatever the head is.
 		{name: "failing change in the base fails the build", headSHA: passSHA, baseSHA: failSHA, wantDone: entity.BuildStatusFailed, wantWait: 12 * time.Second},
 		{name: "unrecorded change passes at once", headSHA: unknownSHA, wantDone: entity.BuildStatusSucceeded},
+		{name: "a pair member passes alone", headSHA: pairBSHA, wantDone: entity.BuildStatusSucceeded, wantWait: 3 * time.Second},
+		{name: "a pair fails when its partner is in the base", headSHA: pairBSHA, baseSHA: pairASHA, wantDone: entity.BuildStatusFailed, wantWait: 3 * time.Second},
+		{name: "the pair fails whichever side is recorded", headSHA: pairASHA, baseSHA: pairBSHA, wantDone: entity.BuildStatusFailed, wantWait: 3 * time.Second},
+		{name: "a pair member with an unrelated base passes", headSHA: pairBSHA, baseSHA: passSHA, wantDone: entity.BuildStatusSucceeded, wantWait: 6 * time.Second},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -112,6 +121,8 @@ func TestTruth(t *testing.T) {
 		"recorded failure":                   {shas: []string{failSHA}, wantFails: true, wantKnown: true},
 		"one failing change fails the batch": {shas: []string{passSHA, failSHA}, wantFails: true, wantKnown: true},
 		"unrecorded":                         {shas: []string{unknownSHA}},
+		"a pair member alone passes":         {shas: []string{pairASHA}, wantKnown: true},
+		"a pair together fails":              {shas: []string{pairASHA, pairBSHA}, wantFails: true, wantKnown: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var changes []change.Change

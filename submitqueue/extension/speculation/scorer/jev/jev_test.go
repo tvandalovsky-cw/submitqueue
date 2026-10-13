@@ -293,6 +293,258 @@ func TestBatchStateContext(t *testing.T) {
 	})
 }
 
+// patchOf returns a patch of exactly n bytes made of whole 8-byte lines, so
+// tests can place a budget boundary on or between lines.
+func patchOf(n int) string {
+	return strings.Repeat("+line01\n", n/8) + strings.Repeat("x", n%8)
+}
+
+func filesOf(n int) []entity.ChangedFile {
+	files := make([]entity.ChangedFile, n)
+	for i := range files {
+		files[i] = entity.ChangedFile{Path: fmt.Sprintf("f%04d.go", i), LinesAdded: 1}
+	}
+	return files
+}
+
+// codeBytes is the code a state carries, split into the two budgets.
+func codeBytes(doc batchStateDoc) (diff, context int) {
+	for _, cs := range doc.Changes {
+		diff += len(cs.Diff)
+		for _, f := range cs.ModifiedFiles {
+			context += len(f.Path) + len(f.Content)
+		}
+		if cs.RepositoryContext != nil {
+			for _, c := range cs.RepositoryContext.Callers {
+				context += len(c.CallSite.Text) + len(c.DeclarationBefore) + len(c.DeclarationAfter)
+			}
+			for _, d := range cs.RepositoryContext.Definitions {
+				context += len(d.Definition.Text)
+			}
+		}
+	}
+	return diff, context
+}
+
+func TestBatchStateFileCap(t *testing.T) {
+	const (
+		uriA = "git://example.com/repo/refs%2Fheads%2Fa/1111111111111111111111111111111111111111"
+		uriB = "git://example.com/repo/refs%2Fheads%2Fb/2222222222222222222222222222222222222222"
+	)
+	tests := []struct {
+		name          string
+		filesA        int
+		filesB        int
+		wantDescribed int
+		wantTruncated bool
+	}{
+		{name: "under the cap describes every file", filesA: 10, filesB: 5, wantDescribed: 15},
+		{name: "exactly the cap is not truncated", filesA: maxFilesInState, wantDescribed: maxFilesInState},
+		{name: "one past the cap is truncated", filesA: maxFilesInState + 1, wantDescribed: maxFilesInState, wantTruncated: true},
+		{name: "the cap is per batch, not per change", filesA: maxFilesInState - 1, filesB: 2, wantDescribed: maxFilesInState, wantTruncated: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			changes := entity.BatchChanges{Queue: "q", Changes: []entity.ChangeInfo{
+				{URI: uriA, Details: entity.ChangeDetails{ChangedFiles: filesOf(tt.filesA)}},
+				{URI: uriB, Details: entity.ChangeDetails{ChangedFiles: filesOf(tt.filesB)}},
+			}}
+			doc := batchStateWithDefaults(changes, nil)
+			described := 0
+			for _, cs := range doc.Changes {
+				described += len(cs.FileStats)
+			}
+			assert.Equal(t, tt.wantDescribed, described)
+			assert.Equal(t, tt.wantTruncated, doc.FilesTruncated)
+			assert.Equal(t, tt.filesA+tt.filesB, doc.TotalFiles, "totals count every file, described or not")
+			assert.Len(t, doc.Changes, 2, "a change past the cap is still listed")
+		})
+	}
+}
+
+func TestBatchStateDiffBudget(t *testing.T) {
+	const (
+		uriA = "git://example.com/repo/refs%2Fheads%2Fa/1111111111111111111111111111111111111111"
+		uriB = "git://example.com/repo/refs%2Fheads%2Fb/2222222222222222222222222222222222222222"
+		uriC = "git://example.com/repo/refs%2Fheads%2Fc/3333333333333333333333333333333333333333"
+	)
+	changes := entity.BatchChanges{Queue: "q", Changes: []entity.ChangeInfo{{URI: uriC}, {URI: uriA}, {URI: uriB}}}
+
+	t.Run("a diff exactly at the budget is sent whole", func(t *testing.T) {
+		patch := patchOf(DefaultMaxDiffBytes)
+		doc := batchStateWithDefaults(entity.BatchChanges{Queue: "q", Changes: []entity.ChangeInfo{{URI: uriA}}},
+			map[string]entity.ChangeDiff{uriA: {URI: uriA, Patch: patch}})
+		assert.Equal(t, patch, doc.Changes[0].Diff)
+		assert.False(t, doc.Changes[0].DiffTruncated)
+	})
+
+	t.Run("one byte past the budget is cut at a line boundary", func(t *testing.T) {
+		doc := batchStateWithDefaults(entity.BatchChanges{Queue: "q", Changes: []entity.ChangeInfo{{URI: uriA}}},
+			map[string]entity.ChangeDiff{uriA: {URI: uriA, Patch: patchOf(DefaultMaxDiffBytes) + "+tail\n"}})
+		cs := doc.Changes[0]
+		assert.True(t, cs.DiffTruncated)
+		assert.LessOrEqual(t, len(cs.Diff), DefaultMaxDiffBytes)
+		assert.True(t, strings.HasSuffix(cs.Diff, "\n"), "no line is sent half-cut")
+	})
+
+	// The budget is shared in URI order: the change that crosses it is cut,
+	// and every change after it is listed with no code at all.
+	t.Run("the budget is per batch and spent in URI order", func(t *testing.T) {
+		third := DefaultMaxDiffBytes * 5 / 8
+		doc := batchStateWithDefaults(changes, map[string]entity.ChangeDiff{
+			uriA: {URI: uriA, Patch: patchOf(third)},
+			uriB: {URI: uriB, Patch: patchOf(third)},
+			uriC: {URI: uriC, Patch: patchOf(third)},
+		})
+		require.Len(t, doc.Changes, 3)
+		a, b, c := doc.Changes[0], doc.Changes[1], doc.Changes[2]
+		assert.Equal(t, []string{uriA, uriB, uriC}, []string{a.URI, b.URI, c.URI})
+
+		assert.Len(t, a.Diff, third)
+		assert.False(t, a.DiffTruncated)
+		assert.NotEmpty(t, b.Diff)
+		assert.Less(t, len(b.Diff), third)
+		assert.True(t, b.DiffTruncated)
+		assert.Empty(t, c.Diff)
+		assert.True(t, c.DiffTruncated, "a change the budget never reached is marked, not silently empty")
+
+		diff, _ := codeBytes(doc)
+		assert.LessOrEqual(t, diff, DefaultMaxDiffBytes)
+	})
+
+	t.Run("a change with no diff is not marked truncated", func(t *testing.T) {
+		doc := batchStateWithDefaults(changes, map[string]entity.ChangeDiff{
+			uriA: {URI: uriA, Patch: patchOf(DefaultMaxDiffBytes * 2)},
+		})
+		assert.True(t, doc.Changes[0].DiffTruncated)
+		assert.False(t, doc.Changes[1].DiffTruncated)
+		assert.False(t, doc.Changes[2].DiffTruncated)
+	})
+}
+
+func TestBatchStateContextBudget(t *testing.T) {
+	const (
+		uriA = "git://example.com/repo/refs%2Fheads%2Fa/1111111111111111111111111111111111111111"
+		uriB = "git://example.com/repo/refs%2Fheads%2Fb/2222222222222222222222222222222222222222"
+	)
+	changes := entity.BatchChanges{Queue: "q", Changes: []entity.ChangeInfo{{URI: uriA}, {URI: uriB}}}
+	caller := entity.CodeReference{
+		Kind: entity.CodeReferenceKindCaller, Symbol: "Scale", Path: "report.go", Line: 4, Text: "return Scale(v)",
+		DeclarationBefore: "func Scale(v int) int {", DeclarationAfter: "func Scale(v, f int) int {",
+	}
+
+	t.Run("context has its own budget beside a full diff budget", func(t *testing.T) {
+		doc := batchStateWithDefaults(changes, map[string]entity.ChangeDiff{
+			uriA: {URI: uriA, Patch: patchOf(DefaultMaxDiffBytes), Files: []entity.FileContent{{Path: "a.go", Content: "package p\n"}}},
+		})
+		cs := doc.Changes[0]
+		assert.False(t, cs.DiffTruncated)
+		assert.Equal(t, []fileContentState{{Path: "a.go", Content: "package p\n"}}, cs.ModifiedFiles)
+		assert.False(t, cs.ContextTruncated)
+	})
+
+	t.Run("context is spent only after every diff", func(t *testing.T) {
+		doc := batchStateWithDefaults(changes, map[string]entity.ChangeDiff{
+			uriA: {URI: uriA, Patch: "+a\n", Files: []entity.FileContent{{Path: "big.go", Content: patchOf(DefaultMaxContextBytes * 2)}}},
+			uriB: {URI: uriB, Patch: "+b\n", Files: []entity.FileContent{{Path: "b.go", Content: "package p\n"}}},
+		})
+		a, b := doc.Changes[0], doc.Changes[1]
+		assert.Equal(t, "+b\n", b.Diff, "an earlier change's context never displaces a later change's diff")
+		assert.False(t, b.DiffTruncated)
+		require.Len(t, a.ModifiedFiles, 1)
+		assert.True(t, a.ModifiedFiles[0].Truncated)
+		assert.Empty(t, b.ModifiedFiles, "the first change's context spent the budget")
+		assert.True(t, b.ContextTruncated)
+	})
+
+	t.Run("references past the budget are dropped and flagged", func(t *testing.T) {
+		refs := make([]entity.CodeReference, 2*DefaultMaxContextBytes/len(caller.Text))
+		for i := range refs {
+			refs[i] = caller
+		}
+		doc := batchStateWithDefaults(changes, map[string]entity.ChangeDiff{uriA: {URI: uriA, References: refs}})
+		cs := doc.Changes[0]
+		require.NotNil(t, cs.RepositoryContext)
+		assert.NotEmpty(t, cs.RepositoryContext.Callers)
+		assert.Less(t, len(cs.RepositoryContext.Callers), len(refs))
+		assert.True(t, cs.ContextTruncated)
+		_, context := codeBytes(doc)
+		assert.LessOrEqual(t, context, DefaultMaxContextBytes)
+	})
+}
+
+// With every option on and every part over its limit, a request carries at
+// most the two budgets of code; there is no separate overall cap.
+func TestBatchStateCodeIsBoundedByBothBudgets(t *testing.T) {
+	caller := entity.CodeReference{
+		Kind: entity.CodeReferenceKindCaller, Symbol: "Scale", Path: "report.go", Line: 4, Text: "return Scale(v)",
+		DeclarationBefore: "func Scale(v int) int {", DeclarationAfter: "func Scale(v, f int) int {",
+	}
+	var changes entity.BatchChanges
+	content := map[string]entity.ChangeDiff{}
+	for i := range 5 {
+		uri := fmt.Sprintf("git://example.com/repo/refs%%2Fheads%%2Fc%d/%040d", i, i)
+		changes.Changes = append(changes.Changes, entity.ChangeInfo{URI: uri, Details: entity.ChangeDetails{ChangedFiles: filesOf(maxFilesInState)}})
+		refs := make([]entity.CodeReference, 500)
+		for j := range refs {
+			refs[j] = caller
+		}
+		content[uri] = entity.ChangeDiff{
+			URI:        uri,
+			Patch:      patchOf(DefaultMaxDiffBytes),
+			Files:      []entity.FileContent{{Path: fmt.Sprintf("f%d.go", i), Content: patchOf(DefaultMaxContextBytes)}},
+			References: refs,
+		}
+	}
+
+	doc := batchStateWithDefaults(changes, content)
+
+	diff, context := codeBytes(doc)
+	assert.LessOrEqual(t, diff, DefaultMaxDiffBytes)
+	assert.LessOrEqual(t, context, DefaultMaxContextBytes)
+	assert.Greater(t, diff, DefaultMaxDiffBytes*9/10, "the diff budget is used, not just respected")
+	assert.Greater(t, context, DefaultMaxContextBytes*9/10, "the context budget is used, not just respected")
+	assert.True(t, doc.FilesTruncated)
+
+	raw, err := json.Marshal(doc)
+	require.NoError(t, err)
+	code := DefaultMaxDiffBytes + DefaultMaxContextBytes
+	assert.Less(t, len(raw), code+code/2, "metadata and JSON escaping add to the code, not multiply it")
+}
+
+func TestScoreAppliesDefaultBudgets(t *testing.T) {
+	const uri = "git://example.com/repo/refs%2Fheads%2Fa/1111111111111111111111111111111111111111"
+	resolver := changesetfake.New().
+		Set(testBatch.ID, change.Change{URIs: []string{uri}}).
+		SetDetailed(testBatch.ID, entity.BatchChanges{BatchID: testBatch.ID, Queue: testBatch.Queue, Changes: []entity.ChangeInfo{{URI: uri}}})
+	differ := changediffmock.NewMockProvider(gomock.NewController(t))
+	differ.EXPECT().Diff(gomock.Any(), gomock.Any()).Return([]entity.ChangeDiff{{
+		URI:   uri,
+		Patch: patchOf(DefaultMaxDiffBytes * 2),
+		Files: []entity.FileContent{{Path: "a.go", Content: patchOf(DefaultMaxContextBytes * 2)}},
+	}}, nil)
+
+	var got systemOneRequest
+	client, _ := fakeProxy(t, func(w nethttp.ResponseWriter, req systemOneRequest) {
+		got = req
+		noulResponse(0.9)(w, req)
+	})
+	s := New(Params{HTTPClient: client, Resolver: resolver, Differ: differ})
+	_, err := s.Score(context.Background(), testBatch, entity.SpeculationPathSet{})
+	require.NoError(t, err)
+
+	var state batchStateDoc
+	raw, err := json.Marshal(got.State)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &state))
+	cs := state.Changes[0]
+	assert.True(t, cs.DiffTruncated)
+	assert.LessOrEqual(t, len(cs.Diff), DefaultMaxDiffBytes, "zero MaxDiffBytes means the default, not unlimited")
+	require.Len(t, cs.ModifiedFiles, 1)
+	assert.True(t, cs.ModifiedFiles[0].Truncated)
+	assert.LessOrEqual(t, len(cs.ModifiedFiles[0].Content), DefaultMaxContextBytes, "zero MaxContextBytes means the default, not unlimited")
+}
+
 func TestTruncatePatch(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -401,4 +653,145 @@ func TestCacheEvictsOldest(t *testing.T) {
 
 func batchStateWithDefaults(changes entity.BatchChanges, content map[string]entity.ChangeDiff) batchStateDoc {
 	return batchState(changes, content, DefaultMaxDiffBytes, DefaultMaxContextBytes)
+}
+
+type batchLoaderFunc func(ctx context.Context, queue, id string) (entity.Batch, error)
+
+func (f batchLoaderFunc) Batch(ctx context.Context, queue, id string) (entity.Batch, error) {
+	return f(ctx, queue, id)
+}
+
+func TestScoreSendsChangesAhead(t *testing.T) {
+	const (
+		ownURI   = "git://example.com/repo/refs%2Fheads%2Fb/2222222222222222222222222222222222222222"
+		aheadURI = "git://example.com/repo/refs%2Fheads%2Fa/1111111111111111111111111111111111111111"
+		doneURI  = "git://example.com/repo/refs%2Fheads%2Fz/3333333333333333333333333333333333333333"
+	)
+	head := entity.Batch{ID: "9", Queue: "test-queue", Contains: []string{"9"}, Dependencies: []string{"8", "5"}}
+	batches := map[string]entity.Batch{
+		"8": {ID: "8", Queue: "test-queue", Contains: []string{"8"}, State: entity.BatchStateSpeculating},
+		"5": {ID: "5", Queue: "test-queue", Contains: []string{"5"}, State: entity.BatchStateSucceeded},
+	}
+	loader := batchLoaderFunc(func(_ context.Context, _, id string) (entity.Batch, error) {
+		b, ok := batches[id]
+		if !ok {
+			return entity.Batch{}, errors.New("no such batch")
+		}
+		return b, nil
+	})
+	resolver := func() *changesetfake.Resolver {
+		return changesetfake.New().
+			Set("9", change.Change{URIs: []string{ownURI}}).
+			SetDetailed("9", entity.BatchChanges{BatchID: "9", Queue: "test-queue", Changes: []entity.ChangeInfo{{URI: ownURI}}}).
+			Set("8", change.Change{URIs: []string{aheadURI}}).
+			SetDetailed("8", entity.BatchChanges{BatchID: "8", Queue: "test-queue", Changes: []entity.ChangeInfo{{URI: aheadURI}}}).
+			Set("5", change.Change{URIs: []string{doneURI}}).
+			SetDetailed("5", entity.BatchChanges{BatchID: "5", Queue: "test-queue", Changes: []entity.ChangeInfo{{URI: doneURI}}})
+	}
+	newDiffer := func(t *testing.T, aheadPatch string) *changediffmock.MockProvider {
+		differ := changediffmock.NewMockProvider(gomock.NewController(t))
+		differ.EXPECT().Diff(gomock.Any(), change.Change{URIs: []string{ownURI}}).
+			Return([]entity.ChangeDiff{{URI: ownURI, Patch: "+return scale(v)\n"}}, nil).AnyTimes()
+		differ.EXPECT().Diff(gomock.Any(), change.Change{URIs: []string{aheadURI}}).
+			Return([]entity.ChangeDiff{{
+				URI: aheadURI, Patch: aheadPatch,
+				Files:      []entity.FileContent{{Path: "scale.go", Content: "package p\n"}},
+				References: []entity.CodeReference{{Kind: entity.CodeReferenceKindDefinition, Symbol: "x", Path: "x.go", Text: "func x() {}"}},
+			}}, nil).AnyTimes()
+		return differ
+	}
+	capture := func(t *testing.T) (*nethttp.Client, *systemOneRequest) {
+		var got systemOneRequest
+		client, _ := fakeProxy(t, func(w nethttp.ResponseWriter, req systemOneRequest) {
+			got = req
+			noulResponse(0.2)(w, req)
+		})
+		return client, &got
+	}
+	decode := func(t *testing.T, req *systemOneRequest) batchStateDoc {
+		raw, err := json.Marshal(req.State)
+		require.NoError(t, err)
+		var doc batchStateDoc
+		require.NoError(t, json.Unmarshal(raw, &doc))
+		return doc
+	}
+
+	t.Run("unfinished dependencies are sent as changes ahead", func(t *testing.T) {
+		client, got := capture(t)
+		s := New(Params{HTTPClient: client, Resolver: resolver(), Differ: newDiffer(t, "-func scale(v int) int {\n+func scale(v, f int) int {\n"), Ahead: loader})
+		p, err := s.Score(context.Background(), head, entity.SpeculationPathSet{})
+		require.NoError(t, err)
+		assert.InDelta(t, 0.2, p, 1e-9)
+
+		doc := decode(t, got)
+		require.Len(t, doc.Changes, 1, "the changes ahead are not part of the batch")
+		assert.Equal(t, ownURI, doc.Changes[0].URI)
+		require.NotNil(t, doc.ChangesAhead)
+		assert.Equal(t, changesAheadDescription, doc.ChangesAhead.Description)
+		require.Len(t, doc.ChangesAhead.Changes, 1, "a dependency that already landed is skipped")
+		ahead := doc.ChangesAhead.Changes[0]
+		assert.Equal(t, aheadURI, ahead.URI)
+		assert.Equal(t, "-func scale(v int) int {\n+func scale(v, f int) int {\n", ahead.Diff)
+		assert.Empty(t, ahead.ModifiedFiles, "changes ahead carry their diff only")
+		assert.Nil(t, ahead.RepositoryContext)
+		assert.Equal(t, landsOnTopQuestion, got.Questions[questionName])
+	})
+
+	t.Run("the ahead budget is its own", func(t *testing.T) {
+		client, got := capture(t)
+		s := New(Params{HTTPClient: client, Resolver: resolver(), Differ: newDiffer(t, patchOf(DefaultMaxAheadBytes*2)), Ahead: loader})
+		_, err := s.Score(context.Background(), head, entity.SpeculationPathSet{})
+		require.NoError(t, err)
+		doc := decode(t, got)
+		assert.Equal(t, "+return scale(v)\n", doc.Changes[0].Diff, "context from the queue never displaces the batch's own code")
+		ahead := doc.ChangesAhead.Changes[0]
+		assert.True(t, ahead.DiffTruncated)
+		assert.LessOrEqual(t, len(ahead.Diff), DefaultMaxAheadBytes)
+	})
+
+	t.Run("without a loader the request is unchanged", func(t *testing.T) {
+		client, got := capture(t)
+		s := New(Params{HTTPClient: client, Resolver: resolver(), Differ: newDiffer(t, "+x\n")})
+		_, err := s.Score(context.Background(), head, entity.SpeculationPathSet{})
+		require.NoError(t, err)
+		assert.Nil(t, decode(t, got).ChangesAhead)
+		assert.Equal(t, landsQuestion, got.Questions[questionName])
+	})
+
+	t.Run("only finished dependencies means no changes ahead", func(t *testing.T) {
+		client, got := capture(t)
+		landed := head
+		landed.Dependencies = []string{"5"}
+		s := New(Params{HTTPClient: client, Resolver: resolver(), Differ: newDiffer(t, "+x\n"), Ahead: loader})
+		_, err := s.Score(context.Background(), landed, entity.SpeculationPathSet{})
+		require.NoError(t, err)
+		assert.Nil(t, decode(t, got).ChangesAhead)
+		assert.Equal(t, landsQuestion, got.Questions[questionName])
+	})
+
+	t.Run("a batch ahead that cannot be loaded falls back", func(t *testing.T) {
+		client, calls := fakeProxy(t, noulResponse(0.9))
+		missing := head
+		missing.Dependencies = []string{"404"}
+		s := New(Params{HTTPClient: client, Resolver: resolver(), Differ: newDiffer(t, "+x\n"), Ahead: loader, Fallback: staticScorer(0.5)})
+		p, err := s.Score(context.Background(), missing, entity.SpeculationPathSet{})
+		require.NoError(t, err)
+		assert.InDelta(t, 0.5, p, 1e-9)
+		assert.Zero(t, calls.Load())
+	})
+
+	t.Run("the cache keys on the dependencies", func(t *testing.T) {
+		client, calls := fakeProxy(t, noulResponse(0.4))
+		cache := NewCache(10)
+		s := New(Params{HTTPClient: client, Resolver: resolver(), Differ: newDiffer(t, "+x\n"), Ahead: loader, Cache: cache})
+		_, err := s.Score(context.Background(), head, entity.SpeculationPathSet{})
+		require.NoError(t, err)
+		_, err = s.Score(context.Background(), head, entity.SpeculationPathSet{})
+		require.NoError(t, err)
+		fewer := head
+		fewer.Dependencies = []string{"8"}
+		_, err = s.Score(context.Background(), fewer, entity.SpeculationPathSet{})
+		require.NoError(t, err)
+		assert.Equal(t, int32(2), calls.Load(), "the same dependencies hit the cache; different ones ask again")
+	})
 }

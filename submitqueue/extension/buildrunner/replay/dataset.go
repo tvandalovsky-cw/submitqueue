@@ -78,6 +78,30 @@ type Attempt struct {
 	// passing attempt of the same PR: the failure came from something other
 	// than the code, such as infrastructure or another change in its group.
 	FlakySuspect bool `json:"flaky_suspect,omitempty"`
+	// FailsWith lists the ReplaySHAs of changes this one fails together with,
+	// though each passes alone: a conflict in the code that a textual merge
+	// does not see. Symmetric in effect; recording it on one side suffices.
+	FailsWith []string `json:"fails_with,omitempty"`
+}
+
+// anyFails reports whether a build holding found fails: one of them is
+// recorded as failing, or two of them are recorded as failing together.
+func anyFails(found []Attempt) bool {
+	present := make(map[string]bool, len(found))
+	for _, a := range found {
+		present[a.ReplaySHA] = true
+	}
+	for _, a := range found {
+		if a.Outcome == OutcomeFail {
+			return true
+		}
+		for _, other := range a.FailsWith {
+			if present[other] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Load reads a dataset written by tool/replaybench.

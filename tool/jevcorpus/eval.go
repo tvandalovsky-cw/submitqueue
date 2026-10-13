@@ -63,7 +63,7 @@ type evalFlags struct {
 	dataset, manifest, sandbox, scorers, out     string
 	baseURL, baseURLEnv, tokenEnv, path, model   string
 	timeout                                      time.Duration
-	diff, files, references                      bool
+	diff, files, references, ahead               bool
 	maxDiffBytes, maxContextBytes                int
 	batchSize, batches, concurrency, limit, bins int
 	seed                                         int64
@@ -75,7 +75,10 @@ type evalRow struct {
 	Branches []string `json:"branches"`
 	Lands    bool     `json:"lands"`
 	// Slices are the result groups the row is graded in.
-	Slices    []string           `json:"slices"`
+	Slices []string `json:"slices"`
+	// Compiles is whether the batch's changes pass the compile check, as
+	// recorded at generation.
+	Compiles  bool               `json:"compiles"`
 	DiffBytes int                `json:"diff_bytes"`
 	Scores    map[string]float64 `json:"scores"`
 	Errors    map[string]string  `json:"errors,omitempty"`
@@ -95,7 +98,7 @@ func runEval(args []string) error {
 	fs.StringVar(&f.dataset, "dataset", "", "dataset written by generate (required)")
 	fs.StringVar(&f.manifest, "manifest", "", "manifest written by generate; defaults to the one beside -dataset")
 	fs.StringVar(&f.sandbox, "sandbox", "", "sandbox repository written by generate (required)")
-	fs.StringVar(&f.scorers, "scorers", "size,jev", "comma-separated scorers to grade: size, jev")
+	fs.StringVar(&f.scorers, "scorers", "size,jev", "comma-separated scorers to grade: size, compile, jev")
 	fs.StringVar(&f.out, "out", "", "write every row and report as JSON here")
 	fs.StringVar(&f.baseURL, "base-url", "", "jev: proxy root; defaults to $LITE_URL")
 	fs.StringVar(&f.baseURLEnv, "base-url-env", "LITE_URL", "jev: environment variable holding the proxy root")
@@ -106,6 +109,7 @@ func runEval(args []string) error {
 	fs.BoolVar(&f.diff, "diff", true, "jev: send each change's diff")
 	fs.BoolVar(&f.files, "files", false, "jev: also send touched files in full")
 	fs.BoolVar(&f.references, "references", false, "jev: also send callers and definitions")
+	fs.BoolVar(&f.ahead, "ahead", false, "also score each pair side with the other side queued ahead of it, sent as changes_ahead")
 	fs.IntVar(&f.maxDiffBytes, "max-diff-bytes", 0, "jev: diff budget per batch; zero is the scorer's default")
 	fs.IntVar(&f.maxContextBytes, "max-context-bytes", 0, "jev: context budget per batch; zero is the scorer's default")
 	fs.IntVar(&f.batchSize, "batch-size", 3, "changes per multi-change batch")
@@ -183,11 +187,19 @@ func evaluate(ctx context.Context, f evalFlags) error {
 		return errors.New("dataset has no materialized changes")
 	}
 
-	names, scorers, err := buildScorers(f, resolver, repo)
+	batches, rows := planEvalBatches(changes, m.Pairs, f, rand.New(rand.NewSource(f.seed)))
+	loader := batchesByID{}
+	for _, b := range batches {
+		loader[b.ID] = b
+	}
+	compiled := map[string]bool{}
+	for _, row := range rows {
+		compiled[row.Batch] = row.Compiles
+	}
+	names, scorers, err := buildScorers(f, resolver, repo, loader, compileScorer(compiled))
 	if err != nil {
 		return err
 	}
-	batches, rows := planEvalBatches(changes, f, rand.New(rand.NewSource(f.seed)))
 	logf("scoring %d batches with %s", len(batches), strings.Join(names, ", "))
 	scoreRows(ctx, batches, rows, names, scorers, f.concurrency)
 
@@ -199,7 +211,7 @@ func evaluate(ctx context.Context, f evalFlags) error {
 	return nil
 }
 
-func buildScorers(f evalFlags, resolver changeset.Resolver, repo *gitrepo.Repo) ([]string, map[string]scorer.Scorer, error) {
+func buildScorers(f evalFlags, resolver changeset.Resolver, repo *gitrepo.Repo, ahead jev.BatchLoader, compile scorer.Scorer) ([]string, map[string]scorer.Scorer, error) {
 	cfg := scorer.Config{QueueName: evalQueue}
 	scorers := map[string]scorer.Scorer{}
 	var names []string
@@ -210,6 +222,8 @@ func buildScorers(f evalFlags, resolver changeset.Resolver, repo *gitrepo.Repo) 
 			continue
 		case "size":
 			scorers[name] = sizeScorer{resolver: resolver}
+		case "compile":
+			scorers[name] = compile
 		case "jev":
 			client, err := jevClient(f)
 			if err != nil {
@@ -227,9 +241,10 @@ func buildScorers(f evalFlags, resolver changeset.Resolver, repo *gitrepo.Repo) 
 			scorers[name] = jev.New(jev.Params{
 				Config: cfg, HTTPClient: client, Path: f.path, Model: f.model, Timeout: f.timeout,
 				Resolver: resolver, Differ: differ, MaxDiffBytes: f.maxDiffBytes, MaxContextBytes: f.maxContextBytes,
+				Ahead: ahead,
 			})
 		default:
-			return nil, nil, fmt.Errorf("unknown scorer %q; want size or jev", name)
+			return nil, nil, fmt.Errorf("unknown scorer %q; want size, compile or jev", name)
 		}
 		names = append(names, name)
 	}
@@ -257,6 +272,30 @@ func jevClient(f evalFlags) (*nethttp.Client, error) {
 	return client, nil
 }
 
+// compileScorer prices a batch from the compile check recorded at
+// generation: a type-checker's verdict, with no model. It is the baseline for
+// any conflict a compiler can see, and blind to one that only tests reveal.
+type compileScorer map[string]bool
+
+func (c compileScorer) Score(_ context.Context, batch entity.Batch, _ entity.SpeculationPathSet) (float64, error) {
+	if c[batch.ID] {
+		return 0.99, nil
+	}
+	return 0.01, nil
+}
+
+// batchesByID is a jev.BatchLoader over the batches the evaluation planned,
+// standing in for the orchestrator's batch store.
+type batchesByID map[string]entity.Batch
+
+func (m batchesByID) Batch(_ context.Context, _, id string) (entity.Batch, error) {
+	b, ok := m[id]
+	if !ok {
+		return entity.Batch{}, fmt.Errorf("no planned batch %s", id)
+	}
+	return b, nil
+}
+
 // sizeScorer prices a batch by its size alone, falling as lines grow.
 type sizeScorer struct {
 	resolver changeset.Resolver
@@ -270,36 +309,76 @@ func (s sizeScorer) Score(ctx context.Context, batch entity.Batch, _ entity.Spec
 	return 1 / (1 + float64(changes.TotalLinesChanged())/sizeScale), nil
 }
 
-// planEvalBatches returns one batch per change, then f.batches sampled
-// batches of f.batchSize distinct changes. A batch lands only if every change
-// in it does, matching the replay runner.
-func planEvalBatches(changes []ManifestChange, f evalFlags, r *rand.Rand) ([]entity.Batch, []evalRow) {
+// planEvalBatches returns one batch per change, one batch per pair holding
+// both sides, then f.batches sampled batches of f.batchSize distinct single
+// changes. A sampled batch lands only if every change in it does, matching the
+// replay runner; a pair lands as it was verified together.
+func planEvalBatches(changes []ManifestChange, pairs []ManifestPair, f evalFlags, r *rand.Rand) ([]entity.Batch, []evalRow) {
 	var batches []entity.Batch
 	var rows []evalRow
-	add := func(members []int, slices []string) {
-		b := entity.Batch{ID: strconv.Itoa(len(batches) + 1), Queue: evalQueue}
-		row := evalRow{Batch: b.ID, Lands: true, Slices: slices}
+	add := func(members []int, lands, compiles bool, slices []string, ahead ...string) {
+		b := entity.Batch{ID: strconv.Itoa(len(batches) + 1), Queue: evalQueue, Dependencies: ahead}
+		row := evalRow{Batch: b.ID, Lands: lands, Compiles: compiles, Slices: slices}
 		for _, i := range members {
 			b.Contains = append(b.Contains, strconv.Itoa(i+1))
 			row.Branches = append(row.Branches, changes[i].Branch)
-			row.Lands = row.Lands && changes[i].Lands
 			row.DiffBytes += changes[i].DiffBytes
 		}
 		batches = append(batches, b)
 		rows = append(rows, row)
 	}
+	indexOf := map[string]int{}
+	var singles []int
 	for i, c := range changes {
-		add([]int{i}, singleSlices(c))
+		indexOf[c.Branch] = i
+		add([]int{i}, c.Lands, c.Compiles, singleSlices(c))
+		if c.Pair == "" {
+			singles = append(singles, i)
+		}
 	}
-	if f.batchSize > 1 && f.batchSize <= len(changes) {
+	for _, p := range pairs {
+		a, okA := indexOf[p.A]
+		b, okB := indexOf[p.B]
+		if !okA || !okB {
+			continue
+		}
+		add([]int{a, b}, p.Lands, p.CompilesTogether, []string{"pairs", "pair " + pairFamily(p.Mutator), "pair " + p.Mutator})
+		if f.ahead {
+			// Each change's own batch has the ID of its position, as added
+			// above; the other side is named as a dependency by that ID.
+			family := "ahead " + pairFamily(p.Mutator)
+			add([]int{b}, p.Lands, p.CompilesTogether, []string{"ahead", family, "ahead " + p.Mutator, "ahead: B with A ahead"}, strconv.Itoa(a+1))
+			add([]int{a}, p.Lands, p.CompilesTogether, []string{"ahead", family, "ahead " + p.Mutator, "ahead: A with B ahead"}, strconv.Itoa(b+1))
+		}
+	}
+	if f.batchSize > 1 && f.batchSize <= len(singles) {
 		for n := 0; n < f.batches; n++ {
-			add(r.Perm(len(changes))[:f.batchSize], []string{fmt.Sprintf("batch of %d", f.batchSize)})
+			var members []int
+			lands, compiles := true, true
+			for _, k := range r.Perm(len(singles))[:f.batchSize] {
+				members = append(members, singles[k])
+				lands = lands && changes[singles[k]].Lands
+				compiles = compiles && changes[singles[k]].Compiles
+			}
+			add(members, lands, compiles, []string{fmt.Sprintf("batch of %d", f.batchSize)})
 		}
 	}
 	return batches, rows
 }
 
+// pairFamily groups a conflicting pair mutator with its compatible twin, so a
+// family's AUC asks whether a scorer tells the two apart.
+func pairFamily(mutator string) string {
+	if family, _, ok := strings.Cut(mutator, "-vs-"); ok {
+		return "family " + family
+	}
+	return "family helper"
+}
+
 func singleSlices(c ManifestChange) []string {
+	if c.Pair != "" {
+		return []string{"pair member alone"}
+	}
 	slices := []string{"all", "tier " + string(c.Tier), "category " + c.Category()}
 	if c.Needle.Position != NeedleNone {
 		slices = append(slices, "needle "+string(c.Needle.Position))

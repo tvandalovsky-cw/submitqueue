@@ -34,10 +34,5 @@ func Truth(idx Index) oracle.Truth {
 
 func (t truth) Outcome(_ context.Context, changes []change.Change) (bool, bool, error) {
 	found := t.r.recorded(changes)
-	for _, a := range found {
-		if a.Outcome == OutcomeFail {
-			return true, true, nil
-		}
-	}
-	return false, len(found) > 0, nil
+	return anyFails(found), len(found) > 0, nil
 }
