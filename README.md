@@ -1,5 +1,7 @@
 # SubmitQueue
 
+> **About this fork:** This is a fork of [uber/submitqueue](https://github.com/uber/submitqueue) that integrates JEV as a speculation scorer. JEV is a decision model, reached through a LiteLLM proxy, that judges whether a PR (a batch of changes) will pass or fail. SubmitQueue uses that probability to decide which speculative paths to build first. It reads the batch's changes, and can optionally read their diffs, file contents and code references. If the model is unavailable, it falls back to the `heuristic` scorer. See the [jev scorer README](submitqueue/extension/speculation/scorer/jev/README.md) and the [code-aware scoring RFC](doc/rfc/submitqueue/code-aware-scoring.md) for details.
+
 [![CI](https://github.com/uber/submitqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/uber/submitqueue/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-uber.github.io%2Fsubmitqueue-blue)](https://uber.github.io/submitqueue/)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/uber/submitqueue)](go.mod)
