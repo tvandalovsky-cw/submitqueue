@@ -31,6 +31,10 @@ services:
       # resolves to. The build runner stays fake here; the change provider and
       # the merge are real.
       - PROFILES_CONFIG_PATH=/etc/submitqueue/profiles.yaml
+      # Optional LiteLLM proxy for demo-queue's jev scorer. Unset, the scorer
+      # falls back to the heuristic and the stack starts as before.
+      - LITE_URL=${LITE_URL:-}
+      - LITE_KEY=${LITE_KEY:-}
     volumes:
       - ${SQ_PROVIDER_CONFIG_DIR}:/etc/submitqueue:ro
       # The same bare repository Runway merges into, read-only: the orchestrator

@@ -1,0 +1,42 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "context.go",
+        "differ.go",
+    ],
+    importpath = "github.com/uber/submitqueue/submitqueue/extension/changediff/git",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//platform/base/change:go_default_library",
+        "//platform/base/change/git:go_default_library",
+        "//platform/metrics:go_default_library",
+        "//submitqueue/entity:go_default_library",
+        "//submitqueue/extension/changediff:go_default_library",
+        "@com_github_uber_go_tally//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["differ_test.go"],
+    # The pinned git, so these assertions describe the build the services run
+    # rather than whatever the host happens to have.
+    data = ["@git"],
+    embed = [":go_default_library"],
+    env = {
+        "SUBMITQUEUE_TEST_GIT": "$(location @git//:git)",
+    },
+    deps = [
+        "//platform/base/change:go_default_library",
+        "//platform/git/exec:go_default_library",
+        "//platform/git/exectest:go_default_library",
+        "//platform/git/repo:go_default_library",
+        "//submitqueue/entity:go_default_library",
+        "//submitqueue/extension/changediff:go_default_library",
+        "@com_github_stretchr_testify//assert:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@com_github_uber_go_tally//:go_default_library",
+    ],
+)

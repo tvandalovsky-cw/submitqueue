@@ -1,0 +1,33 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "fetch.go",
+        "main.go",
+        "materialize.go",
+    ],
+    importpath = "github.com/uber/submitqueue/tool/replaybench",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//platform/base/change/git:go_default_library",
+        "//submitqueue/extension/buildrunner/replay:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "replaybench",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["fetch_test.go"],
+    embed = [":go_default_library"],
+    deps = [
+        "//submitqueue/extension/buildrunner/replay:go_default_library",
+        "@com_github_stretchr_testify//assert:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+    ],
+)

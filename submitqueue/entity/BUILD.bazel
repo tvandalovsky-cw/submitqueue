@@ -8,6 +8,7 @@ go_library(
         "batch_dependent.go",
         "build.go",
         "cancel.go",
+        "change_diff.go",
         "change_provider.go",
         "change_record.go",
         "conflict.go",

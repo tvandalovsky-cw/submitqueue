@@ -43,6 +43,31 @@ queues:
         target: main
         repoPath: /var/submitqueue/changerepos/demo
     analyzer: {type: pathoverlap, by: directory}
+    # Prices each batch with a System One decision model behind a LiteLLM
+    # proxy, read from LITE_URL and LITE_KEY. Without them every batch takes
+    # the fallback, the same flat price the defaults give, so the queue behaves
+    # exactly as it does without this block. The CoreWeave proxy serves the
+    # TypeSafe pass-through rather than LiteLLM's model-routed /v1/systemone.
+    #
+    # diff sends each change's code with its file list — without it the model
+    # sees only line counts — plus touched files in full and related lines
+    # from elsewhere in the tree. It reads the change provider's own copy (same
+    # repoPath), so the two share one clone and its lock.
+    scorer:
+      base:
+        type: jev
+        jev:
+          model: jev
+          path: /typesafe/v1/systemone
+          timeout: 5s
+          diff:
+            git:
+              remoteUrl: file:///srv/git/sandbox.git
+              target: main
+              repoPath: /var/submitqueue/changerepos/demo
+            files: true
+            references: true
+        fallback: {type: heuristic}
 
   - name: e2e-git-queue
     # Its own copy, separate from demo-queue's: the two agree about the
