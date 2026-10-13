@@ -1,0 +1,52 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "eval.go",
+        "generate.go",
+        "main.go",
+        "manifest.go",
+        "plan.go",
+        "resolver.go",
+    ],
+    importpath = "github.com/uber/submitqueue/tool/jevcorpus",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//platform/base/change:go_default_library",
+        "//platform/base/change/git:go_default_library",
+        "//platform/git/repo:go_default_library",
+        "//platform/http:go_default_library",
+        "//submitqueue/core/changeset:go_default_library",
+        "//submitqueue/entity:go_default_library",
+        "//submitqueue/extension/buildrunner/replay:go_default_library",
+        "//submitqueue/extension/changediff:go_default_library",
+        "//submitqueue/extension/changediff/git:go_default_library",
+        "//submitqueue/extension/changeprovider:go_default_library",
+        "//submitqueue/extension/changeprovider/git:go_default_library",
+        "//submitqueue/extension/speculation/scorer:go_default_library",
+        "//submitqueue/extension/speculation/scorer/jev:go_default_library",
+        "//tool/jevcorpus/grade:go_default_library",
+        "//tool/jevcorpus/mutate:go_default_library",
+        "@com_github_uber_go_tally//:go_default_library",
+        "@org_golang_x_oauth2//:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "jevcorpus",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["plan_test.go"],
+    embed = [":go_default_library"],
+    deps = [
+        "//tool/jevcorpus/mutate:go_default_library",
+        "@com_github_stretchr_testify//assert:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+    ],
+)

@@ -17,6 +17,7 @@ package main
 import (
 	"fmt"
 	nethttp "net/http"
+	"sync"
 
 	orchstorage "github.com/uber/submitqueue/submitqueue/orchestrator/extension/storage"
 
@@ -28,6 +29,7 @@ import (
 	"context"
 
 	platformbuildkite "github.com/uber/submitqueue/platform/buildkite"
+	gitrepo "github.com/uber/submitqueue/platform/git/repo"
 	platformgithubactions "github.com/uber/submitqueue/platform/githubactions"
 	"github.com/uber/submitqueue/platform/http"
 	"github.com/uber/submitqueue/submitqueue/core/changeset"
@@ -36,6 +38,9 @@ import (
 	buildkiterunner "github.com/uber/submitqueue/submitqueue/extension/buildrunner/buildkite"
 	buildfake "github.com/uber/submitqueue/submitqueue/extension/buildrunner/fake"
 	githubactionsrunner "github.com/uber/submitqueue/submitqueue/extension/buildrunner/githubactions"
+	"github.com/uber/submitqueue/submitqueue/extension/buildrunner/replay"
+	"github.com/uber/submitqueue/submitqueue/extension/changediff"
+	gitdiffer "github.com/uber/submitqueue/submitqueue/extension/changediff/git"
 	"github.com/uber/submitqueue/submitqueue/extension/changeprovider"
 	cpfake "github.com/uber/submitqueue/submitqueue/extension/changeprovider/fake"
 	gitprovider "github.com/uber/submitqueue/submitqueue/extension/changeprovider/git"
@@ -54,6 +59,8 @@ import (
 	"github.com/uber/submitqueue/submitqueue/extension/speculation/scorer/evidence"
 	scorerfake "github.com/uber/submitqueue/submitqueue/extension/speculation/scorer/fake"
 	"github.com/uber/submitqueue/submitqueue/extension/speculation/scorer/heuristic"
+	jevscorer "github.com/uber/submitqueue/submitqueue/extension/speculation/scorer/jev"
+	"github.com/uber/submitqueue/submitqueue/extension/speculation/scorer/oracle"
 	"github.com/uber/submitqueue/submitqueue/extension/speculation/speculator"
 	specstandard "github.com/uber/submitqueue/submitqueue/extension/speculation/speculator/standard"
 )
@@ -248,6 +255,35 @@ type profileBuilder struct {
 	resolver changeset.Resolver
 	stores   orchstorage.Factory
 	built    map[string]any
+
+	// jevMu guards jevShared, which buildScorer reaches from concurrent
+	// speculation runs rather than only at startup.
+	jevMu     sync.Mutex
+	jevShared map[string]jevShared
+
+	// replayMu guards replayIndexes: one load per dataset path, shared by the
+	// replay runner and the oracle reading it.
+	replayMu      sync.Mutex
+	replayIndexes map[string]replay.Index
+
+	// repoMu guards changeRepos: one copy per repoPath, so a change provider
+	// and a jev diff source naming the same path share the copy and its lock.
+	repoMu      sync.Mutex
+	changeRepos map[string]*gitrepo.Repo
+}
+
+// jevShared is what every jev scorer built from one configuration shares: one
+// HTTP client and one price cache. A nil client means the endpoint or key was
+// not set, so those scorers always fall back.
+type jevShared struct {
+	client *nethttp.Client
+	cache  *jevscorer.Cache
+	// diffRepo is the copy diffs are read from; nil sends no code.
+	diffRepo *gitrepo.Repo
+	// diffFiles and diffReferences select the context sent with each diff.
+	diffFiles, diffReferences bool
+	// maxDiffBytes and maxContextBytes cap the code sent per batch.
+	maxDiffBytes, maxContextBytes int
 }
 
 func (b *profileBuilder) build(cfg queueProfileConfig, where string) (Profile, error) {
@@ -375,9 +411,162 @@ func (b *profileBuilder) buildScorer(c scorer.Config, cfg scorerConfig, where, s
 		// avg is the only combine the schema admits.
 		return composite.New(c, components, composite.Avg, b.scope.SubScope(scopeName)), nil
 
+	case scorerTypeJev:
+		fallback, err := b.buildScorer(c, *cfg.Fallback, where, scopeName+".fallback")
+		if err != nil {
+			return nil, err
+		}
+		shared, err := b.jevSharedFor(*cfg.Jev, where)
+		if err != nil {
+			return nil, err
+		}
+		var differ changediff.Provider
+		if shared.diffRepo != nil {
+			differ = gitdiffer.New(gitdiffer.Params{
+				Config:            changediff.Config{QueueName: c.QueueName},
+				Repo:              shared.diffRepo,
+				MetricsScope:      b.scope.SubScope(scopeName),
+				IncludeFiles:      shared.diffFiles,
+				IncludeReferences: shared.diffReferences,
+			})
+		}
+		return jevscorer.New(jevscorer.Params{
+			Config:          c,
+			HTTPClient:      shared.client,
+			Differ:          differ,
+			MaxDiffBytes:    shared.maxDiffBytes,
+			MaxContextBytes: shared.maxContextBytes,
+			Path:            cfg.Jev.Path,
+			Model:           cfg.Jev.Model,
+			Timeout:         timeoutOr(cfg.Jev.Timeout, defaultJevTimeout),
+			Resolver:        b.resolver,
+			Cache:           shared.cache,
+			Fallback:        fallback,
+			Logger:          b.logger.Sugar(),
+			MetricsScope:    b.scope.SubScope(scopeName),
+		}), nil
+
+	case scorerTypeOracle:
+		fallback, err := b.buildScorer(c, *cfg.Fallback, where, scopeName+".fallback")
+		if err != nil {
+			return nil, err
+		}
+		b.logger.Warn("oracle scorer configured: it reads recorded outcomes and is for benchmarks only",
+			zap.String("profile", where), zap.String("queue", c.QueueName))
+		truth := oracle.MarkerTruth()
+		if cfg.Oracle != nil && cfg.Oracle.Dataset != "" {
+			idx, err := b.replayIndexFor(cfg.Oracle.Dataset)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", where, err)
+			}
+			truth = replay.Truth(idx)
+		}
+		return oracle.New(oracle.Params{Config: c, Resolver: b.resolver, Truth: truth, Fallback: fallback}), nil
+
 	default:
 		return nil, fmt.Errorf("%s: unknown scorer type %q", where, cfg.Type)
 	}
+}
+
+// jevSharedFor returns the client and cache for a jev configuration, building
+// them on first use. A missing endpoint or key is logged once and leaves the
+// client nil rather than failing startup, so a stack without credentials still
+// runs on the fallback.
+func (b *profileBuilder) jevSharedFor(cfg jevScorerConfig, where string) (jevShared, error) {
+	encoded, err := yamlv3.Marshal(cfg)
+	if err != nil {
+		return jevShared{}, fmt.Errorf("%s: failed to key jev config: %w", where, err)
+	}
+	key := string(encoded)
+
+	b.jevMu.Lock()
+	defer b.jevMu.Unlock()
+	if shared, ok := b.jevShared[key]; ok {
+		return shared, nil
+	}
+
+	shared := jevShared{cache: jevscorer.NewCache(cfg.CacheSize)}
+	if cfg.Diff != nil {
+		repo, err := b.changeRepoFor(*cfg.Diff.Git)
+		if err != nil {
+			return jevShared{}, fmt.Errorf("%s: jev diff: %w", where, err)
+		}
+		shared.diffRepo = repo
+		shared.diffFiles = cfg.Diff.Files
+		shared.diffReferences = cfg.Diff.References
+		shared.maxDiffBytes = cfg.Diff.MaxDiffBytes
+		shared.maxContextBytes = cfg.Diff.MaxContextBytes
+	}
+	baseURL := cfg.BaseURL
+	if baseURL == "" {
+		baseURL, _ = tokenFrom(cfg.BaseURLEnv)
+	}
+	token, hasToken := tokenFrom(cfg.TokenEnv)
+	switch {
+	case baseURL == "":
+		b.logger.Warn("jev scorer has no endpoint; every batch uses the fallback scorer",
+			zap.String("profile", where), zap.String("base_url_env", cfg.BaseURLEnv))
+	case !hasToken:
+		b.logger.Warn("jev scorer has no key; every batch uses the fallback scorer",
+			zap.String("profile", where), zap.String("token_env", cfg.TokenEnv))
+	default:
+		client, err := http.NewClient(baseURL)
+		if err != nil {
+			return jevShared{}, fmt.Errorf("%s: failed to build jev HTTP client: %w", where, err)
+		}
+		client.Timeout = timeoutOr(cfg.Timeout, defaultJevTimeout)
+		client.Transport = &oauth2.Transport{
+			Source: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token}),
+			Base:   client.Transport,
+		}
+		shared.client = client
+		b.logger.Info("jev scorer configured",
+			zap.String("profile", where), zap.String("base_url", baseURL), zap.String("path", cfg.Path), zap.String("model", cfg.Model))
+	}
+
+	if b.jevShared == nil {
+		b.jevShared = make(map[string]jevShared)
+	}
+	b.jevShared[key] = shared
+	return shared, nil
+}
+
+// replayIndexFor loads the replay dataset at path once.
+func (b *profileBuilder) replayIndexFor(path string) (replay.Index, error) {
+	b.replayMu.Lock()
+	defer b.replayMu.Unlock()
+	if idx, ok := b.replayIndexes[path]; ok {
+		return idx, nil
+	}
+	ds, err := replay.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	idx := replay.NewIndex(ds)
+	if b.replayIndexes == nil {
+		b.replayIndexes = make(map[string]replay.Index)
+	}
+	b.replayIndexes[path] = idx
+	return idx, nil
+}
+
+// changeRepoFor returns the provisioned copy at cfg.RepoPath, provisioning it on
+// first use. validateGitRepoPaths guarantees one path never names two remotes.
+func (b *profileBuilder) changeRepoFor(cfg gitProviderConfig) (*gitrepo.Repo, error) {
+	b.repoMu.Lock()
+	defer b.repoMu.Unlock()
+	if repo, ok := b.changeRepos[cfg.RepoPath]; ok {
+		return repo, nil
+	}
+	repo, err := newChangeRepo(b.ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if b.changeRepos == nil {
+		b.changeRepos = make(map[string]*gitrepo.Repo)
+	}
+	b.changeRepos[cfg.RepoPath] = repo
+	return repo, nil
 }
 
 // reuse returns the instance already built for an identical configuration, or
@@ -410,10 +599,9 @@ func (b *profileBuilder) newChangeProviderFactory(cfg changeProviderConfig, wher
 		}), nil
 
 	case changeProviderTypeGit:
-		// One copy per distinct configuration, provisioned now. Queues whose
-		// blocks are identical share it — and therefore share its lock — because
-		// reuse hands them the same factory.
-		repo, err := newChangeRepo(b.ctx, *cfg.Git)
+		// One copy per repoPath, provisioned now and shared — with its lock —
+		// by every queue and jev diff source naming that path.
+		repo, err := b.changeRepoFor(*cfg.Git)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", where, err)
 		}
@@ -561,6 +749,17 @@ func (b *profileBuilder) newBuildRunnerFactory(cfg buildRunnerConfig, where stri
 	case buildRunnerTypeFake:
 		return buildRunnerFunc(func(c buildrunner.Config) (buildrunner.BuildRunner, error) {
 			return buildfake.New(c, b.resolver), nil
+		}), nil
+
+	case buildRunnerTypeReplay:
+		idx, err := b.replayIndexFor(cfg.Dataset)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", where, err)
+		}
+		b.logger.Warn("replay build runner configured: builds answer from recorded CI history; benchmarks only",
+			zap.String("profile", where), zap.String("dataset", cfg.Dataset), zap.Int("recorded", len(idx)))
+		return buildRunnerFunc(func(c buildrunner.Config) (buildrunner.BuildRunner, error) {
+			return replay.New(replay.Params{Config: c, Resolver: b.resolver, Index: idx, TimeScale: cfg.TimeScale}), nil
 		}), nil
 
 	case buildRunnerTypeGitHubActions:

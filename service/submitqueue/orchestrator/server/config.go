@@ -19,9 +19,12 @@ import (
 	"maps"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	yamlv3 "gopkg.in/yaml.v3"
+
+	jevscorer "github.com/uber/submitqueue/submitqueue/extension/speculation/scorer/jev"
 )
 
 // Change provider types selectable from configuration.
@@ -38,6 +41,9 @@ const (
 	buildRunnerTypeFake          = "fake"
 	buildRunnerTypeGitHubActions = "githubactions"
 	buildRunnerTypeBuildkite     = "buildkite"
+	// buildRunnerTypeReplay answers builds from a recorded CI history.
+	// Benchmarks only.
+	buildRunnerTypeReplay = "replay"
 )
 
 // Conflict analyzer types selectable from configuration.
@@ -58,6 +64,20 @@ const (
 	scorerTypeEvidence  = "evidence"
 	scorerTypeHeuristic = "heuristic"
 	scorerTypeComposite = "composite"
+	scorerTypeJev       = "jev"
+	// scorerTypeOracle prices batches from their recorded outcomes. Benchmarks
+	// only: it reads the answer the build will give.
+	scorerTypeOracle = "oracle"
+)
+
+// Defaults for the jev scorer. The environment variable names match the ones
+// the LiteLLM proxy credentials are distributed under.
+const (
+	defaultJevBaseURLEnv = "LITE_URL"
+	defaultJevTokenEnv   = "LITE_KEY"
+	defaultJevModel      = "jev"
+	defaultJevTimeout    = 2 * time.Second
+	defaultJevCacheSize  = 4096
 )
 
 // maxBucket is the open upper bound of a size bucket, and defaultFlatScore the
@@ -210,6 +230,10 @@ type buildRunnerConfig struct {
 	// ExtraInputs are passed to every dispatch alongside the reserved sq_*
 	// inputs (githubactions only).
 	ExtraInputs map[string]string `yaml:"extraInputs"`
+	// Dataset is the replay dataset path (replay only).
+	Dataset string `yaml:"dataset"`
+	// TimeScale divides recorded build durations (replay only); 0 means 1.
+	TimeScale float64 `yaml:"timeScale"`
 }
 
 // analyzerConfig selects how conflicts between concurrent batches are detected.
@@ -229,6 +253,8 @@ type analyzerConfig struct {
 // composite belong on base (and on composite components), not at the top level.
 type scorerConfig struct {
 	Type string `yaml:"type"`
+	// Oracle configures where recorded outcomes come from (oracle only).
+	Oracle *oracleScorerConfig `yaml:"oracle"`
 	// Factors revise the base price, one per piece of evidence (evidence only).
 	// An omitted key keeps the inherited value, or 1 if neither defaults nor
 	// the queue named it.
@@ -243,6 +269,58 @@ type scorerConfig struct {
 	Components map[string]scorerConfig `yaml:"components"`
 	// Combine names how a composite reduces its components. Defaults to "avg".
 	Combine string `yaml:"combine"`
+	// Jev configures the model endpoint (jev only).
+	Jev *jevScorerConfig `yaml:"jev"`
+	// Fallback prices a batch the model could not (jev only). Defaults to the
+	// flat heuristic.
+	Fallback *scorerConfig `yaml:"fallback"`
+}
+
+// jevScorerConfig points a jev scorer at a LiteLLM proxy serving /v1/systemone.
+type jevScorerConfig struct {
+	// BaseURL is the proxy root. When empty it is read from BaseURLEnv.
+	BaseURL string `yaml:"baseUrl"`
+	// BaseURLEnv names the environment variable holding the proxy root.
+	BaseURLEnv string `yaml:"baseUrlEnv"`
+	// TokenEnv names the environment variable holding the proxy virtual key.
+	TokenEnv string `yaml:"tokenEnv"`
+	// Path is the System One route on the proxy. Defaults to LiteLLM's
+	// model-routed /v1/systemone; a proxy exposing only the TypeSafe
+	// pass-through takes /typesafe/v1/systemone.
+	Path string `yaml:"path"`
+	// Model is the proxy's model name for the decision model.
+	Model string `yaml:"model"`
+	// Timeout bounds one model call, as a Go duration ("2s").
+	Timeout string `yaml:"timeout"`
+	// CacheSize caps how many batch prices are kept in memory.
+	CacheSize int `yaml:"cacheSize"`
+	// Diff, when set, sends each change's code to the model alongside its file
+	// list. Absent, the model sees file names and line counts only.
+	Diff *jevDiffConfig `yaml:"diff"`
+}
+
+// jevDiffConfig says where a jev scorer reads diffs from. A git block naming
+// the same repoPath as the queue's git change provider shares its copy.
+type jevDiffConfig struct {
+	// Git reads diffs from a local copy of a git remote.
+	Git *gitProviderConfig `yaml:"git"`
+	// Files adds each touched file's full post-change text.
+	Files bool `yaml:"files"`
+	// References adds untouched callers of symbols the change modifies or
+	// removes, and definitions of symbols it calls but does not define.
+	References bool `yaml:"references"`
+	// MaxDiffBytes and MaxContextBytes cap the code sent per batch. Zero keeps
+	// the scorer's defaults; size them to the model's context window.
+	MaxDiffBytes    int `yaml:"maxDiffBytes"`
+	MaxContextBytes int `yaml:"maxContextBytes"`
+}
+
+// oracleScorerConfig selects an oracle's source of truth. Empty reads the fake
+// build runner's URI markers.
+type oracleScorerConfig struct {
+	// Dataset is a replay dataset; the oracle then agrees with a replay build
+	// runner reading the same file.
+	Dataset string `yaml:"dataset"`
 }
 
 // bucketConfig is one band of a heuristic scorer: batches whose size falls in
@@ -344,23 +422,43 @@ func (c profilesConfig) validateGitRepoPaths() error {
 
 	for _, q := range c.Queues {
 		resolved := c.resolve(q)
-		if resolved.ChangeProvider.Type != changeProviderTypeGit || resolved.ChangeProvider.Git == nil {
-			continue
+		var gits []gitProviderConfig
+		if resolved.ChangeProvider.Type == changeProviderTypeGit && resolved.ChangeProvider.Git != nil {
+			gits = append(gits, *resolved.ChangeProvider.Git)
 		}
-		git := *resolved.ChangeProvider.Git
-		previous, seen := byPath[git.RepoPath]
-		if !seen {
-			byPath[git.RepoPath] = owner{queue: q.Name, cfg: git}
-			continue
-		}
-		if previous.cfg.RemoteURL != git.RemoteURL || previous.cfg.Target != git.Target {
-			return fmt.Errorf(
-				"queues %q and %q share repoPath %q but read different repositories (%s@%s vs %s@%s); give each its own path",
-				previous.queue, q.Name, git.RepoPath,
-				previous.cfg.RemoteURL, previous.cfg.Target, git.RemoteURL, git.Target)
+		gits = append(gits, resolved.Scorer.jevDiffGits()...)
+		for _, git := range gits {
+			previous, seen := byPath[git.RepoPath]
+			if !seen {
+				byPath[git.RepoPath] = owner{queue: q.Name, cfg: git}
+				continue
+			}
+			if previous.cfg.RemoteURL != git.RemoteURL || previous.cfg.Target != git.Target {
+				return fmt.Errorf(
+					"queues %q and %q share repoPath %q but read different repositories (%s@%s vs %s@%s); give each its own path",
+					previous.queue, q.Name, git.RepoPath,
+					previous.cfg.RemoteURL, previous.cfg.Target, git.RemoteURL, git.Target)
+			}
 		}
 	}
 	return nil
+}
+
+// jevDiffGits returns the git diff sources of every jev scorer in the tree.
+func (s scorerConfig) jevDiffGits() []gitProviderConfig {
+	var gits []gitProviderConfig
+	if s.Jev != nil && s.Jev.Diff != nil && s.Jev.Diff.Git != nil {
+		gits = append(gits, *s.Jev.Diff.Git)
+	}
+	for _, child := range []*scorerConfig{s.Base, s.Fallback} {
+		if child != nil {
+			gits = append(gits, child.jevDiffGits()...)
+		}
+	}
+	for _, component := range s.Components {
+		gits = append(gits, component.jevDiffGits()...)
+	}
+	return gits
 }
 
 // resolve returns the full profile for a queue: its own overrides where it has
@@ -528,6 +626,13 @@ func (b *buildRunnerConfig) normalizeAndValidate(where string) error {
 		if b.BaseURL == "" {
 			b.BaseURL = defaultGitHubBaseURL
 		}
+	case buildRunnerTypeReplay:
+		if b.Dataset == "" {
+			return fmt.Errorf("%s: replay build runner requires dataset", where)
+		}
+		if b.TimeScale < 0 {
+			return fmt.Errorf("%s: replay timeScale %v is negative", where, b.TimeScale)
+		}
 	case buildRunnerTypeBuildkite:
 		// A Buildkite client is bound to one pipeline by its base URL, so there
 		// is no meaningful default to fall back on.
@@ -583,8 +688,8 @@ func (s *scorerConfig) normalizeRanking(where string, fillBase bool) error {
 	if s.Type != scorerTypeEvidence {
 		return fmt.Errorf("%s: scorer type %q belongs under base, not at the ranking layer", where, s.Type)
 	}
-	if len(s.Buckets) > 0 || len(s.Components) > 0 || s.Combine != "" {
-		return fmt.Errorf("%s: buckets, components, and combine belong under base", where)
+	if len(s.Buckets) > 0 || len(s.Components) > 0 || s.Combine != "" || s.Jev != nil || s.Fallback != nil {
+		return fmt.Errorf("%s: buckets, components, combine, jev, and fallback belong under base", where)
 	}
 	if err := validateFactors(where, s.Factors); err != nil {
 		return err
@@ -622,7 +727,68 @@ func (s *scorerConfig) normalizeContent(where string) error {
 	if s.Type == "" {
 		s.Type = scorerTypeHeuristic
 	}
+	if s.Type != scorerTypeOracle && s.Oracle != nil {
+		return fmt.Errorf("%s: oracle belongs on an oracle scorer, not %q", where, s.Type)
+	}
+	if s.Type != scorerTypeJev && s.Jev != nil {
+		return fmt.Errorf("%s: jev belongs on a jev scorer, not %q", where, s.Type)
+	}
+	if s.Type != scorerTypeJev && s.Type != scorerTypeOracle && s.Fallback != nil {
+		return fmt.Errorf("%s: fallback belongs on a jev or oracle scorer, not %q", where, s.Type)
+	}
 	switch s.Type {
+	case scorerTypeJev:
+		if s.Jev == nil {
+			s.Jev = &jevScorerConfig{}
+		}
+		if s.Jev.BaseURLEnv == "" {
+			s.Jev.BaseURLEnv = defaultJevBaseURLEnv
+		}
+		if s.Jev.TokenEnv == "" {
+			s.Jev.TokenEnv = defaultJevTokenEnv
+		}
+		if s.Jev.Model == "" {
+			s.Jev.Model = defaultJevModel
+		}
+		if s.Jev.Path == "" {
+			s.Jev.Path = jevscorer.DefaultPath
+		}
+		if !strings.HasPrefix(s.Jev.Path, "/") {
+			return fmt.Errorf("%s: jev path %q must start with /", where, s.Jev.Path)
+		}
+		if s.Jev.CacheSize < 0 {
+			return fmt.Errorf("%s: jev cacheSize %d is negative", where, s.Jev.CacheSize)
+		}
+		if s.Jev.CacheSize == 0 {
+			s.Jev.CacheSize = defaultJevCacheSize
+		}
+		if s.Jev.Diff != nil {
+			if s.Jev.Diff.Git == nil {
+				return fmt.Errorf("%s: jev diff needs a git block", where)
+			}
+			diffSource := changeProviderConfig{Type: changeProviderTypeGit, Git: s.Jev.Diff.Git}
+			if err := diffSource.ensureGit(where + " jev diff"); err != nil {
+				return err
+			}
+			if s.Jev.Diff.MaxDiffBytes < 0 || s.Jev.Diff.MaxContextBytes < 0 {
+				return fmt.Errorf("%s: jev diff byte caps must not be negative", where)
+			}
+		}
+		if s.Fallback == nil {
+			s.Fallback = &scorerConfig{}
+		}
+		if s.Fallback.Type == scorerTypeJev {
+			return fmt.Errorf("%s: a jev scorer cannot fall back to another jev scorer", where)
+		}
+		return s.Fallback.normalizeContent(where + " fallback")
+	case scorerTypeOracle:
+		if s.Fallback == nil {
+			s.Fallback = &scorerConfig{}
+		}
+		if s.Fallback.Type == scorerTypeOracle {
+			return fmt.Errorf("%s: an oracle scorer cannot fall back to another oracle", where)
+		}
+		return s.Fallback.normalizeContent(where + " fallback")
 	case scorerTypeHeuristic:
 		if len(s.Buckets) == 0 {
 			s.Buckets = []bucketConfig{{Min: 0, Max: maxBucket, Score: defaultFlatScore}}

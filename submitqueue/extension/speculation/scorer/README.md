@@ -16,6 +16,10 @@ See [doc/rfc/submitqueue/outcome-scorer.md](../../../../doc/rfc/submitqueue/outc
 
 **`heuristic`** scores a batch by extracting one number from its changes and matching that against ordered buckets, each mapping a `[Min, Max]` range to a probability. The extraction is a caller-supplied `ValueFunc` over the resolved `entity.BatchChanges`, so the same bucketing works for files touched, lines changed, or any other metric. It ignores `paths`.
 
+**`oracle`** knows each batch's recorded outcome and prices it 0.99 or 0.01. It is a benchmarking ceiling, never a production scorer. See [oracle/README.md](oracle/README.md).
+
+**`jev`** asks a System One decision model behind a LiteLLM proxy for the probability that the batch builds and lands, caching successful prices by batch and falling back to another content scorer on failure. It ignores `paths` except to forward them to its fallback. See [jev/README.md](jev/README.md).
+
 **`composite`** runs several named scorers and reduces their scores to one. The reduce function receives the scores keyed by scorer name, so it can weigh sources differently rather than treating them as interchangeable; `Min`, `Max`, and `Avg` are provided. It ignores `paths` except to forward them to children.
 
 ## Adding a backend
