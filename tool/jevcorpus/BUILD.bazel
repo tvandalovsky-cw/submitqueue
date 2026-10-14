@@ -8,6 +8,7 @@ go_library(
         "generate.go",
         "main.go",
         "manifest.go",
+        "modelcall.go",
         "pairs.go",
         "plan.go",
         "resolver.go",
@@ -46,6 +47,7 @@ go_test(
     name = "go_default_test",
     srcs = [
         "behavior_test.go",
+        "modelcall_test.go",
         "plan_test.go",
     ],
     embed = [":go_default_library"],

@@ -62,9 +62,10 @@ const sizeScale = 250
 type evalFlags struct {
 	dataset, manifest, sandbox, scorers, out     string
 	baseURL, baseURLEnv, tokenEnv, path, model   string
+	expectModel, cacheDir                        string
 	timeout                                      time.Duration
 	diff, files, references, ahead               bool
-	maxDiffBytes, maxContextBytes                int
+	maxDiffBytes, maxContextBytes, maxAheadBytes int
 	batchSize, batches, concurrency, limit, bins int
 	seed                                         int64
 }
@@ -83,6 +84,8 @@ type evalRow struct {
 	Scores    map[string]float64 `json:"scores"`
 	Errors    map[string]string  `json:"errors,omitempty"`
 	LatencyMs map[string]int64   `json:"latency_ms"`
+	// Calls are the model requests made while scoring the row, by scorer.
+	Calls map[string][]modelCall `json:"calls,omitempty"`
 }
 
 type evalResult struct {
@@ -105,6 +108,8 @@ func runEval(args []string) error {
 	fs.StringVar(&f.tokenEnv, "token-env", "LITE_KEY", "jev: environment variable holding the virtual key")
 	fs.StringVar(&f.path, "path", jev.DefaultPath, "jev: System One route")
 	fs.StringVar(&f.model, "model", "jev", "jev: proxy model name")
+	fs.StringVar(&f.expectModel, "expect-model", "", "jev: fail any answer whose response names another model, e.g. jev-1.13.0; empty accepts any")
+	fs.StringVar(&f.cacheDir, "cache", "", "jev: directory of responses keyed by exact request bytes; a repeated request is answered from it")
 	fs.DurationVar(&f.timeout, "timeout", 60*time.Second, "jev: bound on one model call")
 	fs.BoolVar(&f.diff, "diff", true, "jev: send each change's diff")
 	fs.BoolVar(&f.files, "files", false, "jev: also send touched files in full")
@@ -112,6 +117,7 @@ func runEval(args []string) error {
 	fs.BoolVar(&f.ahead, "ahead", false, "also score each pair side with the other side queued ahead of it, sent as changes_ahead")
 	fs.IntVar(&f.maxDiffBytes, "max-diff-bytes", 0, "jev: diff budget per batch; zero is the scorer's default")
 	fs.IntVar(&f.maxContextBytes, "max-context-bytes", 0, "jev: context budget per batch; zero is the scorer's default")
+	fs.IntVar(&f.maxAheadBytes, "max-ahead-bytes", 0, "jev: diff budget for changes ahead; zero is the scorer's default")
 	fs.IntVar(&f.batchSize, "batch-size", 3, "changes per multi-change batch")
 	fs.IntVar(&f.batches, "batches", 0, "multi-change batches to sample in addition to one batch per change")
 	fs.IntVar(&f.concurrency, "concurrency", 4, "batches scored at once")
@@ -239,9 +245,9 @@ func buildScorers(f evalFlags, resolver changeset.Resolver, repo *gitrepo.Repo, 
 			// No fallback and no cache: a failure must show as a failure, and
 			// every batch is asked once.
 			scorers[name] = jev.New(jev.Params{
-				Config: cfg, HTTPClient: client, Path: f.path, Model: f.model, Timeout: f.timeout,
+				Config: cfg, HTTPClient: client, Path: f.path, Model: f.model, ExpectModel: f.expectModel, Timeout: f.timeout,
 				Resolver: resolver, Differ: differ, MaxDiffBytes: f.maxDiffBytes, MaxContextBytes: f.maxContextBytes,
-				Ahead: ahead,
+				Ahead: ahead, MaxAheadBytes: f.maxAheadBytes,
 			})
 		default:
 			return nil, nil, fmt.Errorf("unknown scorer %q; want size, compile or jev", name)
@@ -268,7 +274,10 @@ func jevClient(f evalFlags) (*nethttp.Client, error) {
 		return nil, err
 	}
 	client.Timeout = f.timeout
-	client.Transport = &oauth2.Transport{Source: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token}), Base: client.Transport}
+	client.Transport = &modelCallTransport{
+		base:     &oauth2.Transport{Source: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token}), Base: client.Transport},
+		cacheDir: f.cacheDir,
+	}
 	return client, nil
 }
 
@@ -403,8 +412,15 @@ func scoreRows(ctx context.Context, batches []entity.Batch, rows []evalRow, name
 				row.Scores, row.Errors, row.LatencyMs = map[string]float64{}, map[string]string{}, map[string]int64{}
 				for _, name := range names {
 					began := time.Now()
-					p, err := scorers[name].Score(ctx, batches[i], entity.SpeculationPathSet{})
+					callCtx, calls := withModelCallLog(ctx)
+					p, err := scorers[name].Score(callCtx, batches[i], entity.SpeculationPathSet{})
 					row.LatencyMs[name] = time.Since(began).Milliseconds()
+					if made := calls.list(); len(made) > 0 {
+						if row.Calls == nil {
+							row.Calls = map[string][]modelCall{}
+						}
+						row.Calls[name] = made
+					}
 					if err != nil {
 						row.Errors[name] = err.Error()
 						continue
@@ -451,17 +467,31 @@ func gradeRows(rows []evalRow, names []string, bins int) map[string]map[string]g
 func printReports(res evalResult) {
 	for _, name := range res.Scorers {
 		failed := 0
+		failedBySlice := map[string]int{}
 		for _, row := range res.Rows {
 			if _, ok := row.Errors[name]; ok {
 				failed++
+				for _, s := range row.Slices {
+					failedBySlice[s]++
+				}
 			}
 		}
 		fmt.Printf("\n%s: %d batches, %d failed to score\n", name, len(res.Rows), failed)
-		fmt.Printf("%-34s %4s %5s %6s %6s %7s %6s %7s %7s\n", "slice", "n", "lands", "auc", "brier", "logloss", "ece", "p|lands", "p|fails")
+		if line := describeModelCalls(res.Rows, name); line != "" {
+			fmt.Println(line)
+		}
+		// Failed rows are left out of every metric, so a slice whose failures
+		// share a cause (size, say) is graded on a biased sample.
+		fmt.Printf("%-34s %4s %4s %5s %6s %6s %7s %6s %7s %7s\n", "slice", "n", "fail", "lands", "auc", "brier", "logloss", "ece", "p|lands", "p|fails")
 		reports := res.Reports[name]
 		slices := make([]string, 0, len(reports))
 		for s := range reports {
 			slices = append(slices, s)
+		}
+		for s := range failedBySlice {
+			if _, ok := reports[s]; !ok {
+				slices = append(slices, s)
+			}
 		}
 		sort.Slice(slices, func(i, j int) bool { return sliceOrder(slices[i]) < sliceOrder(slices[j]) })
 		for _, s := range slices {
@@ -470,10 +500,50 @@ func printReports(res evalResult) {
 			if r.AUCDefined {
 				auc = fmt.Sprintf("%6.3f", r.AUC)
 			}
-			fmt.Printf("%-34s %4d %5d %6s %6.3f %7.3f %6.3f %7s %7s\n", s, r.N, r.Lands, auc, r.Brier, r.LogLoss, r.ECE,
+			fmt.Printf("%-34s %4d %4d %5d %6s %6.3f %7.3f %6.3f %7s %7s\n", s, r.N, failedBySlice[s], r.Lands, auc, r.Brier, r.LogLoss, r.ECE,
 				meanOrDash(r.MeanLands, r.Lands), meanOrDash(r.MeanFails, r.N-r.Lands))
 		}
 	}
+}
+
+// describeModelCalls summarizes the model requests a scorer made: which models
+// answered, how many came from the cache, and the request sizes that succeeded
+// and failed, which locate a backend's size limit. Empty for a scorer that
+// made none.
+func describeModelCalls(rows []evalRow, name string) string {
+	models := map[string]int{}
+	calls, cached, maxOK, minFailed, maxTokens := 0, 0, 0, 0, 0
+	for _, row := range rows {
+		for _, c := range row.Calls[name] {
+			calls++
+			if c.Cached {
+				cached++
+			}
+			if c.Status >= 200 && c.Status < 300 {
+				models[c.Model]++
+				maxOK = max(maxOK, c.RequestBytes)
+				maxTokens = max(maxTokens, c.InputTokens)
+			} else if minFailed == 0 || c.RequestBytes < minFailed {
+				minFailed = c.RequestBytes
+			}
+		}
+	}
+	if calls == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(models))
+	for m := range models {
+		names = append(names, fmt.Sprintf("%s=%d", m, models[m]))
+	}
+	sort.Strings(names)
+	line := fmt.Sprintf("  calls %d (cached %d); answered by %s; largest answered request %d bytes", calls, cached, strings.Join(names, ", "), maxOK)
+	if maxTokens > 0 {
+		line += fmt.Sprintf(" (max %d input tokens)", maxTokens)
+	}
+	if minFailed > 0 {
+		line += fmt.Sprintf("; smallest failed request %d bytes", minFailed)
+	}
+	return line
 }
 
 // sliceOrder sorts "all" first, then tiers in size order, then everything

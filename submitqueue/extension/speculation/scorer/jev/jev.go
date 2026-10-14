@@ -53,6 +53,10 @@ const (
 	DefaultMaxContextBytes = 64 << 10
 )
 
+// requestBytesBuckets span 1KB to 512KB; a backend's context limit shows as
+// the size above which requests fail.
+var requestBytesBuckets = tally.MustMakeExponentialValueBuckets(1<<10, 2, 10)
+
 // DefaultMaxAheadBytes caps the diff text of the changes ahead sent per batch.
 // It is a budget of its own, so context from the queue never displaces the
 // batch's own code.
@@ -64,18 +68,18 @@ const DefaultMaxAheadBytes = 32 << 10
 var landsOnTopQuestion = systemOneQuestion{
 	Type:         questionTypeNoul,
 	Instructions: "Will this batch of code changes pass its CI build and merge cleanly when it is built on top of changes_ahead? Those changes are queued in front of this batch and land first; they are not part of it. Judge whether the two still build and pass together, in either direction: whether this batch relies on code that changes_ahead renames, removes, redefines or changes the signature of, and whether changes_ahead relies on code that this batch does, or both define the same name. A change may also include modified_files_after_change, the full text of files it modifies, and repository_context, unmodified code elsewhere in the repository that relates to the change.",
-	Criteria: map[string]string{
-		"true":  "The batch builds and its tests pass on top of changes_ahead, and it merges without conflict.",
-		"false": "With changes_ahead in place, the batch fails to build, breaks tests, or cannot be merged.",
+	Criteria: &noulCriteria{
+		True:  "The batch builds and its tests pass on top of changes_ahead, and it merges without conflict.",
+		False: "With changes_ahead in place, the batch fails to build, breaks tests, or cannot be merged.",
 	},
 }
 
 var landsQuestion = systemOneQuestion{
 	Type:         questionTypeNoul,
 	Instructions: "Will this batch of code changes pass its CI build and merge cleanly into the target branch? Judge the code in each change's diff. A change may also include modified_files_after_change, the full text of files it modifies, and repository_context, unmodified code elsewhere in the repository that relates to the change.",
-	Criteria: map[string]string{
-		"true":  "The batch builds, its tests pass, and it merges without conflict.",
-		"false": "The batch fails to build, breaks tests, or cannot be merged.",
+	Criteria: &noulCriteria{
+		True:  "The batch builds, its tests pass, and it merges without conflict.",
+		False: "The batch fails to build, breaks tests, or cannot be merged.",
 	},
 }
 
@@ -90,6 +94,10 @@ type Params struct {
 	Path string
 	// Model is the LiteLLM model name to ask.
 	Model string
+	// ExpectModel, when set, is the concrete model version an answer must name;
+	// an answer from any other is a failure. A proxy alias or pass-through can
+	// route to another model, whose prices are not comparable.
+	ExpectModel string
 	// Timeout bounds one model call. Zero means only ctx bounds it.
 	Timeout time.Duration
 	// Resolver resolves a batch into its changes. Nil makes every score fall
@@ -219,12 +227,16 @@ func (s *jevScorer) askModel(ctx context.Context, batch entity.Batch) (float64, 
 		state.ChangesAhead = ahead
 		question = landsOnTopQuestion
 	}
-	price, model, err := askNoul(ctx, s.p.HTTPClient, s.p.Path, s.p.Model, questionName, question, state)
+	ans, err := askNoul(ctx, s.p.HTTPClient, s.p.Path, s.p.Model, s.p.ExpectModel, questionName, question, state)
+	if ans.RequestBytes > 0 {
+		metrics.NamedHistogram(s.p.MetricsScope, "score", "request_bytes", requestBytesBuckets).RecordValue(float64(ans.RequestBytes))
+	}
 	if err != nil {
 		return 0, err
 	}
-	s.p.Logger.Infow("jev scored batch", "queue", batch.Queue, "batch", batch.ID, "model", model, "probability", price)
-	return price, nil
+	s.p.Logger.Infow("jev scored batch", "queue", batch.Queue, "batch", batch.ID, "model", ans.Model, "probability", ans.P,
+		"request_bytes", ans.RequestBytes, "input_tokens", ans.InputTokens)
+	return ans.P, nil
 }
 
 // contentForBatch returns each change's code keyed by URI, or nil without a

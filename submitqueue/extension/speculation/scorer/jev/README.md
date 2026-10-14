@@ -12,7 +12,9 @@ With an `Ahead` batch loader, the batch's unfinished dependencies are also loade
 
 Sending diffs sends the code to the proxy and its model provider. It is opt-in for that reason.
 
-The answer's `noul` is the price. A refusal, a missing answer, a value outside `[0, 1]`, a non-2xx status or a transport error is a failure.
+The question's `criteria` are always serialized `true` before `false`: request layout moves the model's answers, so it is fixed rather than left to the encoder.
+
+The answer's `noul` is the price. A refusal, a missing answer, a value outside `[0, 1]`, a non-2xx status or a transport error is a failure, as is, with `ExpectModel` set, an answer whose response names another model — a proxy alias or pass-through can route to a different model than the one the prices were judged against. Each call records its request size in the `score.request_bytes` histogram whether or not it succeeds, and a scored batch's log line carries the answering model, the request size and the reported input tokens. A backend's context limit shows up as a request size above which calls fail; the byte budgets below must keep the whole request under it, or large batches silently fall back.
 
 ## Caching and failure
 

@@ -50,9 +50,18 @@ type systemOneQuestion struct {
 	Type string `json:"type"`
 	// Instructions is the question put to the model.
 	Instructions string `json:"instructions,omitempty"`
-	// Criteria describes the answers. For a noul it maps "true" and "false" to
-	// what each means.
-	Criteria map[string]string `json:"criteria,omitempty"`
+	// Criteria describes the answers. Nil sends none.
+	Criteria *noulCriteria `json:"criteria,omitempty"`
+}
+
+// noulCriteria says what a yes and a no mean. It is a struct rather than a map
+// so that "true" is always serialized first: request layout moves this model's
+// answers, and a map would leave the order to the encoder's key sort.
+type noulCriteria struct {
+	// True describes a yes.
+	True string `json:"true"`
+	// False describes a no.
+	False string `json:"false"`
 }
 
 // systemOneResponse is the body of a successful POST /v1/systemone.
@@ -61,6 +70,27 @@ type systemOneResponse struct {
 	Model string `json:"model"`
 	// Answers holds one answer per question name.
 	Answers map[string]systemOneAnswer `json:"answers"`
+	// Usage is what the request cost. Proxies that do not report it send
+	// zeros.
+	Usage systemOneUsage `json:"usage"`
+}
+
+// systemOneUsage is the token count of one request.
+type systemOneUsage struct {
+	// InputTokens counts the state and questions as the model read them.
+	InputTokens int `json:"input_tokens"`
+}
+
+// noulAnswer is one answered noul and what asking it cost.
+type noulAnswer struct {
+	// P is the probability that the answer is true.
+	P float64
+	// Model is the concrete model that answered, as the response names it.
+	Model string
+	// RequestBytes is the size of the request body.
+	RequestBytes int
+	// InputTokens is the response's token count, zero when not reported.
+	InputTokens int
 }
 
 // systemOneAnswer is one answer in a System One response. A question the model
@@ -72,42 +102,48 @@ type systemOneAnswer struct {
 	Noul *float64 `json:"noul,omitempty"`
 }
 
-// askNoul sends one noul question about state and returns the probability the
-// answer is true. client must be rooted at the proxy base URL and authenticated.
-func askNoul(ctx context.Context, client *nethttp.Client, path, model, name string, question systemOneQuestion, state any) (float64, string, error) {
+// askNoul sends one noul question about state. client must be rooted at the
+// proxy base URL and authenticated. A non-empty expectModel makes an answer
+// from any other model a failure.
+func askNoul(ctx context.Context, client *nethttp.Client, path, model, expectModel, name string, question systemOneQuestion, state any) (noulAnswer, error) {
 	body, err := json.Marshal(systemOneRequest{
 		Model:     model,
 		State:     state,
 		Questions: map[string]systemOneQuestion{name: question},
 	})
 	if err != nil {
-		return 0, "", fmt.Errorf("marshal system one request: %w", err)
+		return noulAnswer{}, fmt.Errorf("marshal system one request: %w", err)
 	}
+	ans := noulAnswer{RequestBytes: len(body)}
 
 	status, respBody, err := phttp.SendRequest(ctx, client, nethttp.MethodPost, path, body, func(r *nethttp.Request) {
 		r.Header.Set("Content-Type", "application/json")
 	})
 	if err != nil {
-		return 0, "", fmt.Errorf("post %s: %w", path, err)
+		return ans, fmt.Errorf("post %s: %w", path, err)
 	}
 	if status < 200 || status >= 300 {
-		return 0, "", fmt.Errorf("post %s: %w", path, phttp.NewStatusError(status, respBody))
+		return ans, fmt.Errorf("post %s (%d request bytes): %w", path, len(body), phttp.NewStatusError(status, respBody))
 	}
 
 	var resp systemOneResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return 0, "", fmt.Errorf("decode system one response: %w", err)
+		return ans, fmt.Errorf("decode system one response: %w", err)
+	}
+	ans.Model, ans.InputTokens = resp.Model, resp.Usage.InputTokens
+	if expectModel != "" && resp.Model != expectModel {
+		return ans, fmt.Errorf("system one answered with model %q, want %q", resp.Model, expectModel)
 	}
 	answer, ok := resp.Answers[name]
 	if !ok {
-		return 0, resp.Model, fmt.Errorf("system one response has no answer for %q", name)
+		return ans, fmt.Errorf("system one response has no answer for %q", name)
 	}
 	if answer.Type != answerTypeNoul || answer.Noul == nil {
-		return 0, resp.Model, fmt.Errorf("system one answer for %q is %q, not a noul", name, answer.Type)
+		return ans, fmt.Errorf("system one answer for %q is %q, not a noul", name, answer.Type)
 	}
-	p := *answer.Noul
-	if !(p >= 0 && p <= 1) {
-		return 0, resp.Model, fmt.Errorf("system one noul for %q is %v, not a probability", name, p)
+	ans.P = *answer.Noul
+	if !(ans.P >= 0 && ans.P <= 1) {
+		return ans, fmt.Errorf("system one noul for %q is %v, not a probability", name, ans.P)
 	}
-	return p, resp.Model, nil
+	return ans, nil
 }

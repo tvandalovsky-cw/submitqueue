@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	nethttp "net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,12 +72,26 @@ func noulResponse(p float64) func(nethttp.ResponseWriter, systemOneRequest) {
 
 func TestScore(t *testing.T) {
 	tests := []struct {
-		name     string
-		handle   func(nethttp.ResponseWriter, systemOneRequest)
-		fallback scorer.Scorer
-		want     float64
-		wantErr  bool
+		name        string
+		handle      func(nethttp.ResponseWriter, systemOneRequest)
+		fallback    scorer.Scorer
+		expectModel string
+		want        float64
+		wantErr     bool
 	}{
+		{
+			name:        "answer from the expected model is the price",
+			handle:      noulResponse(0.82),
+			expectModel: "jev-1.13.0",
+			want:        0.82,
+		},
+		{
+			name:        "answer from another model falls back",
+			handle:      noulResponse(0.82),
+			expectModel: "jev-1.14.0",
+			fallback:    staticScorer(0.5),
+			want:        0.5,
+		},
 		{
 			name:   "returns the model's noul",
 			handle: noulResponse(0.82),
@@ -115,11 +130,12 @@ func TestScore(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client, _ := fakeProxy(t, tt.handle)
 			s := New(Params{
-				Config:     scorer.Config{QueueName: "test-queue"},
-				HTTPClient: client,
-				Model:      "jev",
-				Resolver:   changesetfake.New(),
-				Fallback:   tt.fallback,
+				Config:      scorer.Config{QueueName: "test-queue"},
+				HTTPClient:  client,
+				Model:       "jev",
+				ExpectModel: tt.expectModel,
+				Resolver:    changesetfake.New(),
+				Fallback:    tt.fallback,
 			})
 			got, err := s.Score(context.Background(), testBatch, entity.SpeculationPathSet{})
 			if tt.wantErr {
@@ -170,6 +186,26 @@ func TestScoreSendsBatchStateAndModel(t *testing.T) {
 			"file_stats": [{"path": "demo/a.go", "lines_added": 10, "lines_deleted": 2}]
 		}]
 	}`, string(state))
+}
+
+func TestScoreSendsCriteriaTrueFirst(t *testing.T) {
+	var body string
+	srv := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		raw, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		body = string(raw)
+		noulResponse(0.9)(w, systemOneRequest{})
+	}))
+	t.Cleanup(srv.Close)
+	client, err := phttp.NewClient(srv.URL)
+	require.NoError(t, err)
+
+	_, err = New(Params{HTTPClient: client, Resolver: changesetfake.New()}).Score(context.Background(), testBatch, entity.SpeculationPathSet{})
+	require.NoError(t, err)
+
+	trueAt, falseAt := strings.Index(body, `"true":`), strings.Index(body, `"false":`)
+	require.GreaterOrEqual(t, trueAt, 0)
+	assert.Less(t, trueAt, falseAt)
 }
 
 func TestScoreSendsDiffs(t *testing.T) {
