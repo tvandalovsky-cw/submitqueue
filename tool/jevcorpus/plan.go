@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/uber/submitqueue/submitqueue/extension/speculation/scorer/jev"
@@ -79,18 +80,97 @@ type spec struct {
 	tier   Tier
 }
 
-// planSpecs balances count changes across intents and tiers: the unsafe share
-// is unsafeRatio, and each intent is spread evenly over the tiers so size never
-// predicts the label.
-func planSpecs(count int, unsafeRatio float64, r *rand.Rand) []spec {
-	unsafe := int(float64(count)*unsafeRatio + 0.5)
-	out := make([]spec, 0, count)
-	for i := 0; i < count; i++ {
-		intent, k := mutate.IntentSafe, i-unsafe
-		if i < unsafe {
-			intent, k = mutate.IntentUnsafe, i
+// defaultTierMix is the share of changes per tier, from 1,650 merged pull
+// requests across six Go repositories: about half under 50 lines, 40% under
+// 500, and the rest split between changes that fit the jev diff budget and
+// changes that do not. See doc/rfc/submitqueue/synthetic-corpus.md.
+const defaultTierMix = "S=50,M=40,L=7,XL=3"
+
+// defaultMaxXL bounds the XL slice. XL changes are rare and slow to verify,
+// and a few dozen are enough to measure what truncation costs.
+const defaultMaxXL = 20
+
+// parseTierMix reads "S=50,M=40,L=7,XL=3" into a weight per tier. A tier left
+// out has no weight; weights need not sum to 100.
+func parseTierMix(mix string) (map[Tier]float64, error) {
+	out := map[Tier]float64{}
+	total := 0.0
+	for _, part := range strings.Split(mix, ",") {
+		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok {
+			return nil, fmt.Errorf("tier mix %q: %q is not tier=weight", mix, part)
 		}
-		out = append(out, spec{intent: intent, tier: tiers[k%len(tiers)]})
+		tier := Tier(strings.ToUpper(strings.TrimSpace(name)))
+		known := false
+		for _, t := range tiers {
+			known = known || t == tier
+		}
+		if !known {
+			return nil, fmt.Errorf("tier mix %q: unknown tier %q", mix, name)
+		}
+		w, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil || w < 0 {
+			return nil, fmt.Errorf("tier mix %q: weight %q is not a non-negative number", mix, value)
+		}
+		out[tier] = w
+		total += w
+	}
+	if total == 0 {
+		return nil, fmt.Errorf("tier mix %q has no positive weight", mix)
+	}
+	return out, nil
+}
+
+// tierCounts splits count over the tiers in proportion to mix, by largest
+// remainder, then caps XL at maxXL and gives the overflow to M, the tier where
+// real failures concentrate.
+func tierCounts(count int, mix map[Tier]float64, maxXL int) map[Tier]int {
+	total := 0.0
+	for _, w := range mix {
+		total += w
+	}
+	counts := map[Tier]int{}
+	type remainder struct {
+		tier Tier
+		frac float64
+	}
+	var rems []remainder
+	assigned := 0
+	for _, t := range tiers {
+		exact := float64(count) * mix[t] / total
+		counts[t] = int(exact)
+		assigned += counts[t]
+		rems = append(rems, remainder{t, exact - float64(counts[t])})
+	}
+	sort.SliceStable(rems, func(i, j int) bool { return rems[i].frac > rems[j].frac })
+	for i := 0; assigned < count; i++ {
+		counts[rems[i%len(rems)].tier]++
+		assigned++
+	}
+	if maxXL >= 0 && counts[TierXL] > maxXL {
+		counts[TierM] += counts[TierXL] - maxXL
+		counts[TierXL] = maxXL
+	}
+	return counts
+}
+
+// planSpecs plans count changes over the tiers by tierCounts, and within each
+// tier designs unsafeRatio of them to fail. Balancing the label inside every
+// tier, rather than the tiers against each other, is what keeps size from
+// predicting the label while the tiers keep their real-world proportions.
+func planSpecs(count int, unsafeRatio float64, mix map[Tier]float64, maxXL int, r *rand.Rand) []spec {
+	counts := tierCounts(count, mix, maxXL)
+	out := make([]spec, 0, count)
+	for _, t := range tiers {
+		n := counts[t]
+		unsafe := int(float64(n)*unsafeRatio + 0.5)
+		for i := 0; i < n; i++ {
+			intent := mutate.IntentSafe
+			if i < unsafe {
+				intent = mutate.IntentUnsafe
+			}
+			out = append(out, spec{intent: intent, tier: t})
+		}
 	}
 	r.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
 	return out

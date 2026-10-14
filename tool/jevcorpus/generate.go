@@ -59,7 +59,8 @@ const queuedAtStepMs = 60_000
 
 type generateFlags struct {
 	repo, base, moduleDir, pkgs, out, sandbox, work, verify string
-	compileCheck                                            string
+	compileCheck, tierMix                                   string
+	maxXL                                                   int
 	count, pairs, behaviorPairs                             int
 	unsafeRatio, unsafePairRatio                            float64
 	seed                                                    int64
@@ -78,7 +79,9 @@ func runGenerate(args []string) error {
 	flags.StringVar(&f.work, "work", "", "working clone to build in; defaults to a temporary directory")
 	flags.StringVar(&f.verify, "verify", defaultVerify, "shell command run at the module root; exit 0 means the change lands")
 	flags.IntVar(&f.count, "count", 40, "single changes to generate")
-	flags.Float64Var(&f.unsafeRatio, "unsafe-ratio", 0.5, "share of single changes designed to fail")
+	flags.Float64Var(&f.unsafeRatio, "unsafe-ratio", 0.5, "share of single changes designed to fail, within every tier")
+	flags.StringVar(&f.tierMix, "tier-mix", defaultTierMix, "share of single changes per size tier, as tier=weight pairs; the default matches merged pull requests")
+	flags.IntVar(&f.maxXL, "max-xl", defaultMaxXL, "most XL single changes to plan, the rest going to M; negative for no cap")
 	flags.IntVar(&f.pairs, "pairs", 0, "pairs of changes to generate, each side landing alone")
 	flags.Float64Var(&f.unsafePairRatio, "unsafe-pair-ratio", 0.5, "share of pairs designed to fail together")
 	flags.IntVar(&f.behaviorPairs, "behavior-pairs", 0, "pairs whose conflict is in behavior: a logic change against a new table test")
@@ -149,7 +152,11 @@ func generate(f generateFlags, sandbox string) error {
 	}
 
 	r := rand.New(rand.NewSource(f.seed))
-	specs := planSpecs(f.count, f.unsafeRatio, r)
+	mix, err := parseTierMix(f.tierMix)
+	if err != nil {
+		return err
+	}
+	specs := planSpecs(f.count, f.unsafeRatio, mix, f.maxXL, r)
 	manifest := Manifest{Repo: f.repo, BaseSHA: base, Seed: f.seed, Verify: f.verify}
 	ds := replay.Dataset{Repo: f.repo, BaseBranch: "main", BaseSHA: base}
 	start := time.Now().UnixMilli()

@@ -77,28 +77,65 @@ func LegacyTotal%[3]d_%[1]d%[2]d(x int) int { return x }
 	return mutate.NewTree(files), c
 }
 
-func TestPlanSpecsBalancesIntentAndTier(t *testing.T) {
-	specs := planSpecs(80, 0.5, rand.New(rand.NewSource(1)))
-	require.Len(t, specs, 80)
+func defaultMix(t *testing.T) map[Tier]float64 {
+	mix, err := parseTierMix(defaultTierMix)
+	require.NoError(t, err)
+	return mix
+}
+
+func TestTierCountsFollowTheMix(t *testing.T) {
+	counts := tierCounts(200, defaultMix(t), -1)
+	assert.Equal(t, map[Tier]int{TierS: 100, TierM: 80, TierL: 14, TierXL: 6}, counts)
+}
+
+func TestTierCountsSumToCount(t *testing.T) {
+	for _, count := range []int{0, 1, 7, 33, 101} {
+		total := 0
+		for _, n := range tierCounts(count, defaultMix(t), defaultMaxXL) {
+			total += n
+		}
+		assert.Equal(t, count, total, "count %d", count)
+	}
+}
+
+func TestTierCountsCapXL(t *testing.T) {
+	counts := tierCounts(100, map[Tier]float64{TierS: 1, TierXL: 1}, 10)
+	assert.Equal(t, 10, counts[TierXL])
+	assert.Equal(t, 40, counts[TierM], "the overflow goes to M")
+	assert.Equal(t, 50, counts[TierS])
+}
+
+func TestPlanSpecsBalancesTheLabelWithinEveryTier(t *testing.T) {
+	specs := planSpecs(200, 0.5, defaultMix(t), -1, rand.New(rand.NewSource(1)))
+	require.Len(t, specs, 200)
 	cells := map[spec]int{}
 	for _, s := range specs {
 		cells[s]++
 	}
-	for _, intent := range []mutate.Intent{mutate.IntentSafe, mutate.IntentUnsafe} {
-		for _, tier := range tiers {
-			assert.Equal(t, 10, cells[spec{intent: intent, tier: tier}], "%s %s", intent, tier)
-		}
+	for tier, n := range map[Tier]int{TierS: 100, TierM: 80, TierL: 14, TierXL: 6} {
+		assert.Equal(t, n/2, cells[spec{intent: mutate.IntentSafe, tier: tier}], "safe %s", tier)
+		assert.Equal(t, n/2, cells[spec{intent: mutate.IntentUnsafe, tier: tier}], "unsafe %s", tier)
 	}
 }
 
 func TestPlanSpecsHonorsUnsafeRatio(t *testing.T) {
 	unsafe := 0
-	for _, s := range planSpecs(40, 0.25, rand.New(rand.NewSource(1))) {
+	for _, s := range planSpecs(40, 0.25, map[Tier]float64{TierS: 1}, -1, rand.New(rand.NewSource(1))) {
 		if s.intent == mutate.IntentUnsafe {
 			unsafe++
 		}
 	}
 	assert.Equal(t, 10, unsafe)
+}
+
+func TestParseTierMix(t *testing.T) {
+	mix, err := parseTierMix("s=2, XL=1")
+	require.NoError(t, err)
+	assert.Equal(t, map[Tier]float64{TierS: 2, TierXL: 1}, mix)
+	for _, bad := range []string{"", "S", "Q=1", "S=-1", "S=x", "S=0,M=0"} {
+		_, err := parseTierMix(bad)
+		assert.Error(t, err, bad)
+	}
 }
 
 func TestTierFor(t *testing.T) {
